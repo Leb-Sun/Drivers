@@ -24,6 +24,7 @@ All `patches/*.py` are idempotent and safe to re-run.
 | `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **needed (workaround)** | UE5/VKD3D-Proton SM6.6 A8xx GPU-hang workaround. See removal criteria below. |
 | `apply_balance_variant.py` (-b) | `tu_autotune.cc` drawcall + bandwidth | **partial** | Only the `*11→*10` bandwidth tweak lands; the `> 5` drawcall anchor was **removed upstream** (now `>= 10`) and is skipped. |
 | `apply_perf_variant.py` (-p) | `tu_autotune.cc` + `tu_knl_kgsl.cc` PWR_MAX | **needed** | KGSL PWR_MAX clock-forcing anchors all present. Same autotune drawcall skip as -b. |
+| `apply_eco_variant.py` (-e) | `tu_device.cc` gmem setup + `tu_autotune.cc` algo resolution | **needed** | A8xx-gated. Adds GMEM budget logging, the `TU_ECO_DEPTH_CACHE_KB` override, and defaults a8xx to the `bandwidth` autotuner. See notes below. |
 
 ### Absorbed / removed by upstream (do NOT re-add)
 - **`TU_DEBUG_FLUSHALL` forced for gen8** — upstream removed the forced flush from
@@ -31,6 +32,38 @@ All `patches/*.py` are idempotent and safe to re-run.
 - **Autotune `drawcall_count > 5` gate** — restructured upstream to `>= 10`. The -b/-p
   scripts skip this tweak cleanly; the two variants now differ by **bandwidth + PWR_MAX**,
   not the drawcall threshold. (Re-target to the new gate only if a split is desired.)
+
+### `apply_eco_variant.py` (-e) — notes
+Two anchors, both fragile in different ways:
+
+- **`tu_device.cc` gmem setup.** The anchor is the `device->dev_info = info;` …
+  `fd6_calc_gmem_cache_offsets(&info, …)` block. The patch **rewrites the call to pass
+  `&device->dev_info` instead of `&info`** — the local `info` is `const`, so the depth-cache
+  override has to be applied to the mutable copy and the offsets computed from that same copy.
+  If upstream changes either the assignment order or the call argument, re-diff carefully:
+  a version that still compiles but reads the *unmodified* struct would silently make
+  `TU_ECO_DEPTH_CACHE_KB` a no-op.
+- **`tu_autotune.cc` algo resolution.** Anchored on the `algo_str` / `drirc.perf.autotune_algo`
+  fallback chain. If upstream stops hardcoding `prefer_sysmem` for DXVK/vkd3d in
+  `00-turnip-defaults.conf`, this override becomes unnecessary — check before keeping it.
+
+Both are A8xx-gated (`fd_dev_gen(...) == 8` / `info->chip == 8`), so a drift that mis-fires
+cannot affect A6xx/A7xx users.
+
+**`TU_ECO_DEPTH_CACHE_KB` accepts only 64/128/192/256.** The CCU depth cache is described twice
+and the two must agree: `gmem_ccu_depth_cache_fraction` is what programs `RB_CCU_CACHE_CNTL`
+(`tu_cmd_buffer.cc`), while `gmem_per_ccu_depth_cache_size` only feeds the GMEM offset maths in
+`fd6_gmem_cache.h`. Setting the size alone leaves the hardware using a larger cache than the
+region reserved for it, and it writes over tile memory. Full depth CCU capacity on a8xx_gen2 is
+256 KB/CCU, so the legal points are QUARTER(2)=64, HALF(1)=128, THREE_QUARTER(3)=192, FULL(0)=256.
+Confirmed on an A840: gmem_size=18874368, usable=16564224, 674 blocks. 192 KB gives 690 blocks,
+enough for a tile-aligned 1080p colour+depth pass in one tile instead of two.
+
+**Why this variant exists:** upstream's `prefer_sysmem` for DX titles is an unconditional early
+return in `tu_autotune.cc` that collects no metrics at all — it disables tiled rendering rather
+than deprioritising it. That is a reasonable default for parts with 1–3 MB of GMEM; A840 has 18 MB.
+The depth CCU cache (256 KB × 6 CCU = 1.5 MB) is the largest single carve-out from GMEM, and on
+A840 a 1080p colour+depth pass lands ~0.9% short of fitting in one bin.
 
 ### Removal criteria to watch on future bumps
 - **`disable_64b_image_atomics.py`**: drop once upstream fixes the A8xx 64-bit image
@@ -43,7 +76,7 @@ All `patches/*.py` are idempotent and safe to re-run.
 
 ## Re-verifying on a mesa bump
 1. `BUILD_VERSION=<ver> ./build_wn_turnip.sh` (clones latest main, applies patches).
-2. Read `build_log_{b,p}.txt`: every script should print an "applied" or an explicit
+2. Read `build_log_{b,e,p}.txt`: every script should print an "applied" or an explicit
    "already/absent/skipping" line. A bare/missing line or a `WARNING:` means an anchor
    drifted — re-diff that script against current upstream before shipping.
 3. Update the table above with the new mesa hash.
@@ -57,10 +90,14 @@ yet it floors at `1.03`. So `1.02` released → next `1.03`, `1.09` → `1.10`, 
 
 The CI (`.github/workflows/build.yml`):
 - **Weekly schedule** (`cron: '0 12 * * 3'`, Wednesdays 12:00 UTC, first run
-  2026-07-08) builds `-b`/`-p` from latest mesa main and **tags + releases** the
+  2026-07-08) builds `-b`/`-e`/`-p` from latest mesa main and **tags + releases** the
   bumped version. Runs every week regardless of whether this repo changed, since
   mesa main advances on its own.
-- **`workflow_dispatch`** does the same on demand.
+- **`workflow_dispatch`** takes two extra inputs:
+  - `variants` (default `b e p`) — build a subset for faster driver-tuning iteration.
+  - `publish` (default **false**) — when false, produces artifacts labelled
+    `<ver>-test` and **never tags or releases**. Set true to cut an actual release.
+    Screening builds should always leave this false.
 - **PR / push** build a preview label only — never tag, never release.
 
 Local builds set the label directly, e.g. `BUILD_VERSION=1.03 ./build_wn_turnip.sh`.

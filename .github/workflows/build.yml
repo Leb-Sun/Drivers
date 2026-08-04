@@ -14,6 +14,15 @@ on:
         description: "Commit SHA or branch to build & release"
         required: false
         default: main
+      variants:
+        description: "Space-separated variants to build (b e p). Fewer = faster screening runs."
+        required: false
+        default: "b e p"
+      publish:
+        description: "Tag and publish a release. Set false for screening builds (artifacts only)."
+        required: false
+        type: boolean
+        default: false
 
 # schedule + workflow_dispatch release (tag + GitHub release, version bumped);
 # PR and push only build a preview. Release events serialize on build-release.
@@ -71,13 +80,21 @@ jobs:
               echo "release=false" >> "$GITHUB_OUTPUT"
               ;;
             schedule|workflow_dispatch)
-              if git rev-parse "v${next_base}" >/dev/null 2>&1; then
-                echo "::error::Tag v${next_base} already exists; refusing to release the same version twice."
-                exit 1
+              # Screening builds need artifacts, not published releases. A manual
+              # dispatch with publish=false produces downloadable zips and never
+              # tags or releases -- which is what driver A/B iteration wants.
+              if [ "${{ github.event.inputs.publish }}" = "false" ]; then
+                build_ver="${next_base}-test"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+              else
+                if git rev-parse "v${next_base}" >/dev/null 2>&1; then
+                  echo "::error::Tag v${next_base} already exists; refusing to release the same version twice."
+                  exit 1
+                fi
+                build_ver="${next_base}"
+                echo "release=true" >> "$GITHUB_OUTPUT"
+                echo "tag_name=v${next_base}" >> "$GITHUB_OUTPUT"
               fi
-              build_ver="${next_base}"
-              echo "release=true" >> "$GITHUB_OUTPUT"
-              echo "tag_name=v${next_base}" >> "$GITHUB_OUTPUT"
               ;;
           esac
           echo "build_version=${build_ver}" >> "$GITHUB_OUTPUT"
@@ -102,20 +119,52 @@ jobs:
           add-to-path: false
           local-cache: true
 
-      - name: Build -b and -p variants
+      - name: Build variants
         env:
           BUILD_VERSION: ${{ steps.ver.outputs.build_version }}
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          BUILD_VARIANTS: ${{ github.event.inputs.variants || 'b e p' }}
         run: ./build_wn_turnip.sh
 
-      - name: Verify output zips exist
+      # Each variant's patch script must report an explicit applied/already/absent
+      # line. A silent no-op means an anchor drifted against upstream mesa and the
+      # variant is not actually what its name claims -- fail rather than ship it.
+      - name: Verify variant patches applied
+        env:
+          BUILD_VARIANTS: ${{ github.event.inputs.variants || 'b e p' }}
         run: |
-          ls -lh "WN-Turnip-${{ steps.ver.outputs.build_version }}-b_Axxx.zip" \
-                  "WN-Turnip-${{ steps.ver.outputs.build_version }}-p_Axxx.zip"
+          # Match on "anchor" specifically. A bare WARNING: match is useless here:
+          # clang emits "warning:" constantly and meson emits an uppercase
+          # "WARNING: cannot auto-detect -mtls-dialect when cross-compiling" on
+          # every cross build, so both case-sensitive and -i variants fired on
+          # every variant regardless of whether anything had actually drifted.
+          drift='anchor absent|WARNING:.*[Aa]nchor'
+          for v in $BUILD_VARIANTS; do
+            log="build_log_${v}.txt"
+            [ -f "$log" ] || { echo "::error::missing $log"; exit 1; }
+            if grep -qE "$drift" "$log"; then
+              echo "::warning::variant $v had a drifted anchor:"
+              grep -E "$drift" "$log" || true
+            fi
+          done
+          if echo "$BUILD_VARIANTS" | grep -qw e; then
+            grep -q "apply_eco_variant.py: done" build_log_e.txt \
+              || { echo "::error::eco variant script did not run"; exit 1; }
+          fi
 
-      # Upload -b and -p as SEPARATE artifacts. A single multi-file artifact is
+      - name: Verify output zips exist
+        env:
+          BUILD_VARIANTS: ${{ github.event.inputs.variants || 'b e p' }}
+        run: |
+          for v in $BUILD_VARIANTS; do
+            ls -lh "WN-Turnip-${{ steps.ver.outputs.build_version }}-${v}_Axxx.zip"
+          done
+
+      # Upload each variant as a SEPARATE artifact. A single multi-file artifact is
       # bundled by GitHub into one .zip; separate names keep the variants apart.
+      # Each is skipped when that variant was not part of this run's selection.
       - name: Upload -b artifact
+        if: contains(format(' {0} ', github.event.inputs.variants || 'b e p'), ' b ')
         uses: actions/upload-artifact@v4
         with:
           name: WN-Turnip-${{ steps.ver.outputs.build_version }}-b_Axxx
@@ -123,12 +172,32 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload -e artifact
+        if: contains(format(' {0} ', github.event.inputs.variants || 'b e p'), ' e ')
+        uses: actions/upload-artifact@v4
+        with:
+          name: WN-Turnip-${{ steps.ver.outputs.build_version }}-e_Axxx
+          path: WN-Turnip-${{ steps.ver.outputs.build_version }}-e_Axxx.zip
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload -p artifact
+        if: contains(format(' {0} ', github.event.inputs.variants || 'b e p'), ' p ')
         uses: actions/upload-artifact@v4
         with:
           name: WN-Turnip-${{ steps.ver.outputs.build_version }}-p_Axxx
           path: WN-Turnip-${{ steps.ver.outputs.build_version }}-p_Axxx.zip
           if-no-files-found: error
+          retention-days: 30
+
+      # The build log is how a drifted anchor is diagnosed after the fact.
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ steps.ver.outputs.build_version }}
+          path: build_log_*.txt
+          if-no-files-found: warn
           retention-days: 30
 
   release:
@@ -153,15 +222,17 @@ jobs:
           target_commitish: ${{ needs.build.outputs.head_sha }}
           files: |
             WN-Turnip-${{ needs.build.outputs.build_version }}-b_Axxx.zip
+            WN-Turnip-${{ needs.build.outputs.build_version }}-e_Axxx.zip
             WN-Turnip-${{ needs.build.outputs.build_version }}-p_Axxx.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
           make_latest: true
 
-      # Also mirror both variants to the shared WinNative-Components release.
+      # Also mirror the variants to the shared WinNative-Components release.
       # Needs a COMPONENTS_TOKEN secret (PAT with contents:write on that repo);
-      # skips cleanly if the secret is absent.
-      - name: Mirror -b/-p to WinNative-Components
+      # skips cleanly if the secret is absent -- which is the case in forks, so a
+      # fork never publishes to the shared repo by accident.
+      - name: Mirror variants to WinNative-Components
         env:
           GH_TOKEN: ${{ secrets.COMPONENTS_TOKEN }}
           VER: ${{ needs.build.outputs.build_version }}
@@ -179,5 +250,6 @@ jobs:
                  --notes "Rolling WinNative Turnip driver uploads."
           gh release upload "$tag" \
             "WN-Turnip-${VER}-b_Axxx.zip" \
+            "WN-Turnip-${VER}-e_Axxx.zip" \
             "WN-Turnip-${VER}-p_Axxx.zip" \
             --repo "$repo" --clobber

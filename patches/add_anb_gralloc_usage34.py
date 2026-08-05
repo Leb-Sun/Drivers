@@ -156,7 +156,32 @@ edit(
 
 edit(VK_ANDROID, ANCHOR_IMPL, NEW_IMPL, "usage3 + usage4 implementations")
 
-# --- 3. dispatch: add the commands to the ANB extension block ----------------
+# --- 3a. command DEFINITIONS in the <commands> section -----------------------
+# Without these the generator emits no prototype and the build fails with
+# -Werror,-Wmissing-prototypes. A <command name="..."/> reference in the
+# extension block is not sufficient on its own.
+edit(
+    VK_XML,
+    """            <param><type>uint64_t</type>* <name>grallocProducerUsage</name></param>
+        </command>""",
+    """            <param><type>uint64_t</type>* <name>grallocProducerUsage</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkGetSwapchainGrallocUsage3ANDROID</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkGrallocUsageInfoANDROID</type>* <name>grallocUsageInfo</name></param>
+            <param><type>uint64_t</type>* <name>grallocUsage</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkGetSwapchainGrallocUsage4ANDROID</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkGrallocUsageInfo2ANDROID</type>* <name>grallocUsageInfo</name></param>
+            <param><type>uint64_t</type>* <name>grallocUsage</name></param>
+        </command>""",
+    "ANB command definitions",
+)
+
+# --- 3b. dispatch: add the commands to the ANB extension block ---------------
 edit(
     VK_XML,
     '                <command name="vkGetSwapchainGrallocUsage2ANDROID" />',

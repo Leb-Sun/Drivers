@@ -74,35 +74,49 @@ vk_image_usage_to_ahb_usage("""
 
 NEW_DEFINE = DEFINE + ANCHOR_DEFINE
 
-# The live path. Insert before the final return so every earlier decision -
-# including the deliberate CPU_WRITE_RARELY/LINEAR case - has already been made.
-ANCHOR_AHB = """   /* No usage bits set - set at least one GPU usage. */
-   if (ahb_usage == 0)
-      ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+# CRITICAL SCOPING - do NOT move this into vk_image_usage_to_ahb_usage().
+#
+# That function serves two callers with opposite needs:
+#   (a) ALLOCATION - what usage should a new swapchain buffer be created with.
+#       UBWC is wanted here.
+#   (b) REQUIREMENT - what usage an image needs, used when validating an IMPORT
+#       of an already-allocated AHardwareBuffer. Demanding UBWC here rejects
+#       every buffer that does not have it.
+#
+# A build that added the bit inside the function produced 448
+# "nativeImportAhbToVulkan failed" errors and "Swapchain re-create failed",
+# giving a black screen: WinNative's X-server images are allocated in
+# gpu_image.c with CPU_READ_OFTEN|CPU_WRITE_OFTEN (logged as usage=0x332) and
+# are therefore linear by necessity. A CPU-bit guard inside the function cannot
+# catch this - it only sees Vulkan-derived usage, which never carries CPU bits.
+#
+# VkAndroidHardwareBufferUsageANDROID chained on the OUTPUT is what distinguishes
+# case (a): it means "tell me what to allocate with". Import validation never
+# chains it. So the bit goes here, at that call site only.
+ANCHOR_AHB = """      ahb_usage->androidHardwareBufferUsage =
+         vk_image_usage_to_ahb_usage(image_flags, image_usage);"""
 
-   return ahb_usage;"""
+NEW_AHB = """      uint64_t wn_ahb_usage =
+         vk_image_usage_to_ahb_usage(image_flags, image_usage);
 
-NEW_AHB = """   /* No usage bits set - set at least one GPU usage. */
-   if (ahb_usage == 0)
-      ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+      /* WN-Turnip: ask gralloc for UBWC. Reaching this block means the caller
+       * chained VkAndroidHardwareBufferUsageANDROID on the output, i.e. it is
+       * asking what to ALLOCATE with - which is the Android loader sizing up a
+       * swapchain buffer. Import-validation paths never chain it, so they keep
+       * the unmodified requirement and can still accept linear buffers.
+       *
+       * Skipped when CPU access is implied: gralloc cannot hand back a
+       * CPU-mappable UBWC buffer, and the MUTABLE_FORMAT case deliberately sets
+       * CPU_WRITE_RARELY to force LINEAR (mesa d02b2515).
+       */
+      if (!(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
+                            AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
+         wn_ahb_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
 
-   /* WN-Turnip: ask gralloc for UBWC. This is the value Android's loader reads
-    * back through VkAndroidHardwareBufferUsageANDROID and uses as the swapchain
-    * producer usage; without it the buffer is allocated linear.
-    *
-    * Never combined with CPU access - gralloc cannot produce a CPU-mappable
-    * UBWC buffer, and the MUTABLE_FORMAT case above sets CPU_WRITE_RARELY
-    * precisely to force LINEAR.
-    */
-   if (!(ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
-                      AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
-      ahb_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
+      mesa_logi("WN-AHB: alloc query -> 0x%" PRIx64 " (create 0x%x usage 0x%x)",
+                wn_ahb_usage, (unsigned) image_flags, (unsigned) image_usage);
 
-   mesa_logi("WN-AHB: vk_image_usage_to_ahb_usage -> 0x%" PRIx64
-             " (create 0x%x usage 0x%x)",
-             (uint64_t) ahb_usage, (unsigned) vk_create, (unsigned) vk_usage);
-
-   return ahb_usage;"""
+      ahb_usage->androidHardwareBufferUsage = wn_ahb_usage;"""
 
 failed = False
 

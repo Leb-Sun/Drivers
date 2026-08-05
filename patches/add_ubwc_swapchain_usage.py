@@ -2,47 +2,50 @@
 """
 Request UBWC-compressed swapchain buffers on Adreno.
 
-WHY
-    Paired same-session SurfaceFlinger captures on an A840 (frame gen ON,
-    upscaling OFF) show the swapchain source buffer differing by exactly one
-    usage bit:
+WHERE THE VALUE ACTUALLY COMES FROM
+    Android 16's Vulkan loader does NOT use vkGetSwapchainGrallocUsageXANDROID
+    in the normal path. frameworks/native/vulkan/libvulkan/swapchain.cpp:1450+
+    does this instead:
 
-        system Adreno driver : usage 0x10000b00  12852 KiB  compressed: true
-        Turnip               : usage 0x00000b00  12768 KiB  compressed: false
+        VkAndroidHardwareBufferUsageANDROID ahb_usage;
+        image_format_properties.pNext = &ahb_usage;
+        GetPhysicalDeviceImageFormatProperties2(pdev, &image_format_info,
+                                                &image_format_properties);
+        ...
+        *producer_usage = ahb_usage.androidHardwareBufferUsage;
+        return VK_SUCCESS;                    <-- returns BEFORE the
+                                                  GetSwapchainGrallocUsageX chain
 
-    12768 KiB is 1216*2688*4 exactly - linear. 12852 KiB is that plus the UBWC
-    metadata plane. Every other buffer on the device carries 0x10000000; only
-    Turnip's swapchain buffer lacks it, so gralloc allocates it uncompressed.
+    That chain (usage/2/3/4) is a legacy fallback for old drivers and is never
+    reached here. An earlier version of this patch targeted it and had no
+    observable effect, which is exactly why.
 
-    0x10000000 is Qualcomm's private "allocate UBWC" gralloc usage bit. Mesa
-    sets no vendor usage bits anywhere today - vk_android.c knows only
-    GRALLOC_USAGE_HW_RENDER and GRALLOC_USAGE_HW_TEXTURE - so Turnip has never
-    asked for compression and gralloc has no reason to grant it.
+    The live path for Turnip is:
+        tu_formats.cc:846
+          -> vk_android_get_ahb_image_properties()   vk_android.c:1181
+            -> vk_image_usage_to_ahb_usage()         vk_android.c:805
+              -> ahb_usage->androidHardwareBufferUsage
 
-    Motivating symptom: GameSpace frame generation renders green under Turnip
-    and correctly under the system driver. Frame interpolation reads TWO full
-    frames per output frame (~26 MB/frame at 1216x2688 linear RGBA) where
-    upscaling reads one; UBWC roughly halves that. UNPROVEN - this patch is the
-    experiment that tests it. Independently, UBWC on the swapchain reduces DRAM
-    traffic on every present regardless of GameSpace.
+    vk_image_usage_to_ahb_usage() maps Vulkan image usage to AHardwareBuffer
+    usage with no vendor bits at all. WinNative asks for COLOR_ATTACHMENT ->
+    GPU_FRAMEBUFFER (0x200); SurfaceFlinger's consumer side contributes
+    HW_COMPOSER|HW_TEXTURE (0x900); total 0xb00 - exactly what the captures show.
+    The blob returns the same plus 0x10000000 and gets 0x10000b00 + UBWC.
 
-WHY NOT THE STANDARD ROUTE
-    VK_EXT_image_compression_control is the vendor-neutral mechanism and
-    vk_android.c:317 has a TODO pointing at it. It does not help here: that
-    extension exists for an *application* to request compression, and
-    WinNative/DXVK never will. The blob does not wait to be asked - it compresses
-    by default. Matching that is a driver default, not an app-facing option.
+    Upstream knows this is incomplete. The same function carries:
+      "XXX We need a better gralloc private query to forward the mutable bit
+       along with the format list for a private vendor usage bit, and leave the
+       decision to gralloc."
 
 GATING
-    0x10000000 lives in AIDL BufferUsage's VENDOR_MASK (bits 28-31), so it means
-    whatever each vendor decides. Setting it on non-Qualcomm hardware could mean
-    something unrelated or fail allocation outright. This build only ever
-    contains freedreno (-Dvulkan-drivers=freedreno), so the bit is emitted only
-    from Turnip's own ANDROID_native_buffer entry points, never unconditionally.
+    0x10000000 is in AIDL BufferUsage's VENDOR_MASK (bits 28-31) and means
+    whatever each vendor decides. This build contains only freedreno
+    (-Dvulkan-drivers=freedreno), so the bit can only ever be emitted by Turnip.
 
-    A better long-term gate is the *detected* gralloc vendor - the AIMapper
-    backend already knows it loaded mapper.qti.so. Worth doing if this proves
-    out; not worth the plumbing before we know the bit helps.
+    Additionally skipped whenever any CPU usage bit is set: gralloc cannot give
+    a CPU-mappable UBWC buffer, and vk_image_usage_to_ahb_usage() deliberately
+    sets CPU_WRITE_RARELY for MUTABLE_FORMAT images specifically to force LINEAR
+    (see mesa d02b2515). Asking for both would be contradictory.
 
 Idempotent. Three states per MAINTENANCE.md.
 """
@@ -51,106 +54,87 @@ import sys
 
 VK_ANDROID = "src/vulkan/runtime/vk_android.c"
 
-# Qualcomm private gralloc usage: allocate UBWC-compressed.
 DEFINE = """
-/* WN-Turnip: Qualcomm private gralloc usage bit requesting a UBWC-compressed
- * allocation. Confirmed by observation - every buffer on an A840 carrying this
- * bit is reported "compressed: true" by SurfaceFlinger and is sized with a UBWC
- * metadata plane; the one buffer without it is exactly w*h*4 and uncompressed.
- * Lives in AIDL BufferUsage's VENDOR_MASK, so it is only ever emitted from this
- * freedreno-only build.
+/* WN-Turnip: Qualcomm private gralloc/AHardwareBuffer usage bit requesting a
+ * UBWC-compressed allocation. Confirmed by observation - every buffer on an
+ * A840 carrying this bit is reported "compressed: true" by SurfaceFlinger and
+ * is sized with a UBWC metadata plane; the one buffer without it is exactly
+ * w*h*4 and uncompressed. Lives in AIDL BufferUsage's VENDOR_MASK, so it is
+ * only ever emitted from this freedreno-only build.
  */
-#define WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC 0x10000000
+#define WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC 0x10000000ull
+
 """
 
-ANCHOR_DEFINE = """static VkResult
-setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
-                     int *out_gralloc_usage)
-{"""
+ANCHOR_DEFINE = """/* Construct ahw usage mask from image usage bits, see
+ * 'AHardwareBuffer Usage Equivalence' in Vulkan spec.
+ */
+uint64_t
+vk_image_usage_to_ahb_usage("""
 
 NEW_DEFINE = DEFINE + ANCHOR_DEFINE
 
-# 1. gralloc0 path
-ANCHOR_G0 = """   if (!gralloc_usage)
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+# The live path. Insert before the final return so every earlier decision -
+# including the deliberate CPU_WRITE_RARELY/LINEAR case - has already been made.
+ANCHOR_AHB = """   /* No usage bits set - set at least one GPU usage. */
+   if (ahb_usage == 0)
+      ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
 
-   *out_gralloc_usage = gralloc_usage;"""
+   return ahb_usage;"""
 
-NEW_G0 = """   if (!gralloc_usage)
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+NEW_AHB = """   /* No usage bits set - set at least one GPU usage. */
+   if (ahb_usage == 0)
+      ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
 
-   /* WN-Turnip: ask gralloc for UBWC. Without this the swapchain is allocated
-    * linear, which the vendor display/video path will not consume for
-    * multi-frame reads (frame interpolation). Adreno-only by construction.
+   /* WN-Turnip: ask gralloc for UBWC. This is the value Android's loader reads
+    * back through VkAndroidHardwareBufferUsageANDROID and uses as the swapchain
+    * producer usage; without it the buffer is allocated linear.
+    *
+    * Never combined with CPU access - gralloc cannot produce a CPU-mappable
+    * UBWC buffer, and the MUTABLE_FORMAT case above sets CPU_WRITE_RARELY
+    * precisely to force LINEAR.
     */
-   gralloc_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
+   if (!(ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
+                      AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
+      ahb_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
 
-   /* DIAGNOSTIC: the first build of this patch produced no observable change
-    * in the allocated buffer (still usage 0xb00, compressed: false), so log
-    * whether this path runs at all and what it asked for. Called once per
-    * swapchain creation, so not spammy. Remove once the route is understood.
-    */
-   mesa_logi("WN-UBWC: setup_gralloc0_usage -> 0x%x (fmt %d img_usage 0x%x)",
-             gralloc_usage, format, image_usage);
+   mesa_logi("WN-AHB: vk_image_usage_to_ahb_usage -> 0x%" PRIx64
+             " (create 0x%x usage 0x%x)",
+             (uint64_t) ahb_usage, (unsigned) vk_create, (unsigned) vk_usage);
 
-   *out_gralloc_usage = gralloc_usage;"""
+   return ahb_usage;"""
 
-# 2. gralloc1 path - the bit is a raw usage value, so it rides on the producer
-#    side (the GPU is what writes these buffers).
-ANCHOR_G1 = """   if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
-      *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;"""
-
-NEW_G1 = """   if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
-      *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
-
-   /* WN-Turnip: carry the UBWC request through the gralloc1 translation. It is
-    * a raw usage bit, not a gralloc1 producer/consumer flag, so it passes
-    * through verbatim on the producer side.
-    */
-   if (gralloc_usage & WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC)
-      *grallocProducerUsage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
-
-   /* DIAGNOSTIC: see the note in setup_gralloc0_usage. Shows which of the two
-    * ANB entry points the Android loader actually calls, and the final
-    * producer/consumer split handed back to it.
-    */
-   mesa_logi("WN-UBWC: GetSwapchainGrallocUsage2 -> producer 0x%llx consumer 0x%llx",
-             (unsigned long long) *grallocProducerUsage,
-             (unsigned long long) *grallocConsumerUsage);"""
+failed = False
 
 
-def edit(content, old, new, what):
+def edit(path, old, new, what):
+    global failed
+    if not os.path.exists(path):
+        print(f"  WARNING: {path} missing - skipping {what}", file=sys.stderr)
+        failed = True
+        return
+    with open(path) as f:
+        content = f.read()
+
     if new in content:
-        print(f"  {VK_ANDROID}: {what} already applied")
-        return content, True
+        print(f"  {path}: {what} already applied")
+        return
     if old not in content:
-        print(f"  WARNING: {VK_ANDROID}: anchor absent for {what} "
+        print(f"  WARNING: {path}: anchor absent for {what} "
               f"- upstream refactored? skipping", file=sys.stderr)
-        return content, False
-    print(f"  {VK_ANDROID}: {what} applied")
-    return content.replace(old, new, 1), True
+        failed = True
+        return
+
+    with open(path, "w") as f:
+        f.write(content.replace(old, new, 1))
+    print(f"  {path}: {what} applied")
 
 
-if not os.path.exists(VK_ANDROID):
-    print(f"  WARNING: {VK_ANDROID} missing - skipping", file=sys.stderr)
-    print("add_ubwc_swapchain_usage.py: done (nothing to do)")
-    sys.exit(0)
+edit(VK_ANDROID, ANCHOR_DEFINE, NEW_DEFINE, "usage bit define")
+edit(VK_ANDROID, ANCHOR_AHB, NEW_AHB, "AHB usage (the live loader path)")
 
-with open(VK_ANDROID) as f:
-    content = f.read()
-
-content, ok_def = edit(content, ANCHOR_DEFINE, NEW_DEFINE, "usage bit define")
-content, ok_g0 = edit(content, ANCHOR_G0, NEW_G0, "gralloc0 usage")
-content, ok_g1 = edit(content, ANCHOR_G1, NEW_G1, "gralloc1 usage")
-
-# The define must land or the two uses will not compile. If its anchor drifted
-# but a use applied, back the whole thing out rather than ship a broken tree.
-if (ok_g0 or ok_g1) and not ok_def and "WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC 0x10000000" not in content:
-    print("  FATAL: define anchor absent but a use applied - not writing",
-          file=sys.stderr)
+if failed:
+    print("  FATAL: a required anchor was missing", file=sys.stderr)
     sys.exit(1)
-
-with open(VK_ANDROID, "w") as f:
-    f.write(content)
 
 print("add_ubwc_swapchain_usage.py: done")

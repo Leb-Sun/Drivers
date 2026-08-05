@@ -85,6 +85,14 @@ NEW_G0 = """   if (!gralloc_usage)
     */
    gralloc_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
 
+   /* DIAGNOSTIC: the first build of this patch produced no observable change
+    * in the allocated buffer (still usage 0xb00, compressed: false), so log
+    * whether this path runs at all and what it asked for. Called once per
+    * swapchain creation, so not spammy. Remove once the route is understood.
+    */
+   mesa_logi("WN-UBWC: setup_gralloc0_usage -> 0x%x (fmt %d img_usage 0x%x)",
+             gralloc_usage, format, image_usage);
+
    *out_gralloc_usage = gralloc_usage;"""
 
 # 2. gralloc1 path - the bit is a raw usage value, so it rides on the producer
@@ -100,7 +108,15 @@ NEW_G1 = """   if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
     * through verbatim on the producer side.
     */
    if (gralloc_usage & WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC)
-      *grallocProducerUsage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;"""
+      *grallocProducerUsage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
+
+   /* DIAGNOSTIC: see the note in setup_gralloc0_usage. Shows which of the two
+    * ANB entry points the Android loader actually calls, and the final
+    * producer/consumer split handed back to it.
+    */
+   mesa_logi("WN-UBWC: GetSwapchainGrallocUsage2 -> producer 0x%llx consumer 0x%llx",
+             (unsigned long long) *grallocProducerUsage,
+             (unsigned long long) *grallocConsumerUsage);"""
 
 
 def edit(content, old, new, what):

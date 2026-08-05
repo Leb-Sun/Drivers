@@ -24,7 +24,7 @@ All `patches/*.py` are idempotent and safe to re-run.
 | `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **needed (workaround)** | UE5/VKD3D-Proton SM6.6 A8xx GPU-hang workaround. See removal criteria below. |
 | `apply_balance_variant.py` (-b) | `tu_autotune.cc` drawcall + bandwidth | **partial** | Only the `*11→*10` bandwidth tweak lands; the `> 5` drawcall anchor was **removed upstream** (now `>= 10`) and is skipped. |
 | `apply_perf_variant.py` (-p) | `tu_autotune.cc` + `tu_knl_kgsl.cc` PWR_MAX | **needed** | KGSL PWR_MAX clock-forcing anchors all present. Same autotune drawcall skip as -b. |
-| `apply_eco_variant.py` (-e) | `tu_device.cc` gmem setup + `tu_autotune.cc` algo resolution | **needed** | A8xx-gated. Adds GMEM budget logging, the `TU_ECO_DEPTH_CACHE_KB` override, and defaults a8xx to the `bandwidth` autotuner. See notes below. |
+| `apply_eco_variant.py` (-e) | `tu_device.cc` gmem setup + `tu_autotune.cc` bandwidth estimate | **needed** | A8xx-gated. Adds GMEM budget logging plus the `TU_ECO_DEPTH_CACHE_KB` and `TU_ECO_GMEM_BW_NUM` tunables. Autotune default matches upstream (`prefer_sysmem`) — see notes below. |
 
 ### Absorbed / removed by upstream (do NOT re-add)
 - **`TU_DEBUG_FLUSHALL` forced for gen8** — upstream removed the forced flush from
@@ -43,11 +43,12 @@ Two anchors, both fragile in different ways:
   If upstream changes either the assignment order or the call argument, re-diff carefully:
   a version that still compiles but reads the *unmodified* struct would silently make
   `TU_ECO_DEPTH_CACHE_KB` a no-op.
-- **`tu_autotune.cc` algo resolution.** Anchored on the `algo_str` / `drirc.perf.autotune_algo`
-  fallback chain. If upstream stops hardcoding `prefer_sysmem` for DXVK/vkd3d in
-  `00-turnip-defaults.conf`, this override becomes unnecessary — check before keeping it.
+- **`tu_autotune.cc` bandwidth estimate.** Anchored on the literal
+  `gmem_bandwidth = (gmem_bandwidth * 11 + total_draw_call_bandwidth) / 10;`. If upstream retunes
+  that constant the anchor vanishes and `TU_ECO_GMEM_BW_NUM` is skipped — which is correct
+  behaviour, but re-diff before assuming the old default still applies.
 
-Both are A8xx-gated (`fd_dev_gen(...) == 8` / `info->chip == 8`), so a drift that mis-fires
+The `tu_device.cc` change is A8xx-gated (`fd_dev_gen(...) == 8`), so a drift that mis-fires
 cannot affect A6xx/A7xx users.
 
 **`TU_ECO_DEPTH_CACHE_KB` accepts only 64/128/192/256.** The CCU depth cache is described twice
@@ -59,11 +60,26 @@ region reserved for it, and it writes over tile memory. Full depth CCU capacity 
 Confirmed on an A840: gmem_size=18874368, usable=16564224, 674 blocks. 192 KB gives 690 blocks,
 enough for a tile-aligned 1080p colour+depth pass in one tile instead of two.
 
-**Why this variant exists:** upstream's `prefer_sysmem` for DX titles is an unconditional early
-return in `tu_autotune.cc` that collects no metrics at all — it disables tiled rendering rather
-than deprioritising it. That is a reasonable default for parts with 1–3 MB of GMEM; A840 has 18 MB.
-The depth CCU cache (256 KB × 6 CCU = 1.5 MB) is the largest single carve-out from GMEM, and on
-A840 a 1080p colour+depth pass lands ~0.9% short of fitting in one bin.
+**Why this variant exists:** to expose A840 GMEM behaviour for measurement. The depth CCU cache
+(256 KB × 6 CCU = 1.5 MB) is the largest single carve-out from GMEM, and on A840 a 1080p
+colour+depth pass lands ~0.9% short of fitting in one bin — so the trade is worth being able to
+sweep. The startup logging is what proved the arithmetic on real hardware.
+
+**The a8xx `bandwidth` autotune default was removed on 2026-08-04. Do not reinstate it without
+new evidence.** It was measured on an A840 and lost: Cyberpunk 2077 +1.05% fps (inside a 37%
+run-to-run spread, i.e. noise), and Subnautica static — the deliberate best case for tiling —
+−3.64% fps, +3.88% J/frame, +5.07% frametime. The logs show why: `prefer_sysmem` reports
+`Metric Flags: 0x0`, an unconditional early return collecting nothing, while `bandwidth` reports
+`0x2 (SAMPLES)` and does real per-renderpass work. When the heuristic lands on sysmem anyway you
+pay to decide and then render identically. Root cause: GMEM saves DRAM round-trips, but these
+workloads are shader-bound at ~90% GPU busy, so bandwidth is not the constraint. Upstream's
+default is not just conservative here — it is cheaper. `TU_AUTOTUNE_ALGO=bandwidth` still selects
+it by hand.
+
+**Note for anyone comparing on-device:** WinNative's stock container env includes
+`TU_DEBUG=noconform,sysmem`, and `TU_DEBUG_SYSMEM` hard-forces sysmem in `tu_cmd_buffer.cc`,
+bypassing driconf *and* the autotuner. Any GMEM-related A/B must drop `sysmem` from that string
+or it is measuring nothing.
 
 ### Removal criteria to watch on future bumps
 - **`disable_64b_image_atomics.py`**: drop once upstream fixes the A8xx 64-bit image

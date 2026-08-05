@@ -22,12 +22,22 @@ Three changes, all A8xx-gated so no other part is affected:
    Accepts only 64/128/192/256 because the fraction enum and the byte size
    describe the same cache and must agree -- see the comment at the call site.
 
-3. tu_autotune.cc -- default A8xx to the adaptive `bandwidth` algorithm.
-   Upstream's 00-turnip-defaults.conf hardcodes `prefer_sysmem` for DXVK/vkd3d,
-   which is an unconditional early return with no metrics collected at all -- on
-   this hardware it disables tiled rendering outright. That was a call made for
-   parts with 1-3 MB of GMEM. TU_AUTOTUNE_ALGO still takes priority, so A/B
-   testing remains possible.
+3. tu_autotune.cc -- TU_ECO_GMEM_BW_NUM override for the GMEM penalty in the
+   bandwidth heuristic's estimate (upstream hardcodes 11/10).
+
+NOTE ON THE AUTOTUNE DEFAULT (removed 2026-08-04, do not reinstate without new
+evidence). This variant previously defaulted A8xx to the adaptive `bandwidth`
+algorithm instead of upstream's `prefer_sysmem`. It was measured on an A840 and
+lost: Cyberpunk 2077 +1.05% fps (inside a 37% run-to-run spread, i.e. noise) and
+Subnautica static -3.64% fps / +3.88% J-per-frame / +5.07% frametime, which was
+the deliberate best case for tiling. The cause is visible in the logs:
+`prefer_sysmem` reports `Metric Flags: 0x0` -- an unconditional early return that
+collects nothing -- while `bandwidth` reports `0x2 (SAMPLES)` and does real
+per-renderpass measurement work. When the heuristic lands on sysmem anyway, you
+pay to decide and render the same way. Root cause: GMEM saves DRAM round-trips,
+but these workloads are shader-bound at ~90% GPU busy, so bandwidth is not the
+constraint. Upstream's default is not merely conservative here, it is cheaper.
+`TU_AUTOTUNE_ALGO=bandwidth` still selects it by hand for retesting.
 
 Idempotent and drift-tolerant per MAINTENANCE.md: each change reports
 applied / already-applied / anchor-absent, and an absent anchor is logged and
@@ -161,34 +171,7 @@ def patch_device():
     print(f"  {DEVICE_CC}: added GMEM budget logging + TU_ECO_DEPTH_CACHE_KB override")
 
 
-# ── 3: default a8xx to the adaptive bandwidth autotuner ──────────────────────
-
-AT_ANCHOR = """      if (algo_str)
-         algo_strv = algo_str;
-      else if (device->instance->drirc.perf.autotune_algo)
-         algo_strv = device->instance->drirc.perf.autotune_algo;
-"""
-
-AT_REPLACEMENT = """      if (algo_str)
-         algo_strv = algo_str;
-      else if (device->instance->drirc.perf.autotune_algo)
-         algo_strv = device->instance->drirc.perf.autotune_algo;
-
-      /* WN-Turnip ECO: upstream hardcodes prefer_sysmem for DXVK/vkd3d, which is
-       * an unconditional early return that collects no metrics -- it disables
-       * tiling outright. That was tuned for parts with 1-3 MB of GMEM; a8xx has
-       * up to 18 MB, where the bandwidth heuristic (which picks whichever mode
-       * moves less DRAM traffic) is the better default. An explicit
-       * TU_AUTOTUNE_ALGO still wins, so this stays A/B-testable.
-       */
-      if (!algo_str && algo_strv == "prefer_sysmem" &&
-          device->physical_device->info->chip == 8) {
-         algo_strv = "bandwidth";
-         if (TU_DEBUG(STARTUP))
-            mesa_logi("WN-ECO: a8xx - overriding drirc prefer_sysmem with bandwidth");
-      }
-"""
-
+# ── 3: tunable GMEM penalty in the bandwidth heuristic ───────────────────────
 
 # tu_autotune.cc uses os_get_option but does not pull in u_debug.h, so
 # debug_get_num_option is not declared there. Add the include rather than
@@ -213,15 +196,6 @@ def patch_autotune():
     content = read(AUTOTUNE_CC)
     if content is None:
         return
-
-    if "WN-ECO: a8xx - overriding drirc" in content:
-        print(f"  {AUTOTUNE_CC}: a8xx autotune default already present")
-    elif AT_ANCHOR not in content:
-        print(f"  {AUTOTUNE_CC}: autotune algo-resolution anchor absent — skipping")
-    else:
-        content = content.replace(AT_ANCHOR, AT_REPLACEMENT, 1)
-        changed_any = True
-        print(f"  {AUTOTUNE_CC}: a8xx now defaults to the bandwidth autotuner")
 
     # The bandwidth heuristic's GMEM estimate is scaled by 11/10, i.e. GMEM is
     # assumed ~10% more expensive than the raw calculation says. On a part with

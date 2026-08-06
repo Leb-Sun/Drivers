@@ -99,15 +99,48 @@ ANCHOR_AHB = """      ahb_usage->androidHardwareBufferUsage =
 NEW_AHB = """      uint64_t wn_ahb_usage =
          vk_image_usage_to_ahb_usage(image_flags, image_usage);
 
-      /* WN-Turnip: ask gralloc for UBWC. Reaching this block means the caller
-       * chained VkAndroidHardwareBufferUsageANDROID on the output, i.e. it is
-       * asking what to ALLOCATE with - which is the Android loader sizing up a
-       * swapchain buffer. Import-validation paths never chain it, so they keep
-       * the unmodified requirement and can still accept linear buffers.
+      /* WN-Turnip: MUTABLE_FORMAT images get CPU_WRITE_RARELY added by
+       * vk_image_usage_to_ahb_usage() purely to force LINEAR - upstream's XXX
+       * there asks for the format list to be forwarded so gralloc can decide
+       * instead. Vulkan already requires mutable view formats to be
+       * texel-block-size compatible; when every view format is the same base
+       * format differing only in sRGB-ness, the UBWC layout is identical and
+       * compression is safe. Recover that case.
        *
-       * Skipped when CPU access is implied: gralloc cannot hand back a
-       * CPU-mappable UBWC buffer, and the MUTABLE_FORMAT case deliberately sets
-       * CPU_WRITE_RARELY to force LINEAR (mesa d02b2515).
+       * Observed: Eden (Switch emulator) creates a mutable swapchain, so the
+       * loader passes create=0x108 (MUTABLE_FORMAT|EXTENDED_USAGE), Mesa forces
+       * linear, and vendor display features that consume the swapchain fail.
+       */
+      const VkImageFormatListCreateInfo *wn_list =
+         vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+
+      if ((image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+          (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY) &&
+          wn_list && wn_list->viewFormatCount > 0) {
+         bool wn_same_layout = true;
+         for (uint32_t wn_i = 0; wn_i < wn_list->viewFormatCount; wn_i++) {
+            if (vk_format_srgb_to_linear(wn_list->pViewFormats[wn_i]) !=
+                vk_format_srgb_to_linear(info->format)) {
+               wn_same_layout = false;
+               break;
+            }
+         }
+         if (wn_same_layout)
+            wn_ahb_usage &= ~(uint64_t) AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+
+         mesa_logi("WN-MUTABLE: %u view formats, same UBWC layout=%d -> %s",
+                   wn_list->viewFormatCount, (int) wn_same_layout,
+                   wn_same_layout ? "allowing UBWC" : "keeping LINEAR");
+      }
+
+      /* Reaching this block means the caller chained
+       * VkAndroidHardwareBufferUsageANDROID on the output, i.e. it is asking
+       * what to ALLOCATE with - the Android loader sizing up a swapchain
+       * buffer. Import-validation paths never chain it, so they keep the
+       * unmodified requirement and can still accept linear buffers.
+       *
+       * Still skipped when CPU access is genuinely implied: gralloc cannot hand
+       * back a CPU-mappable UBWC buffer.
        */
       if (!(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
                             AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))

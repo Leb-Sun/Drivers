@@ -196,6 +196,21 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
       mesa_logw("aimapper: PIXEL_FORMAT_FOURCC unavailable");
       return -EINVAL;
    }
+
+   /* QTI's mapper returns 0 for some buffers (observed on UBWC swapchain
+    * images) even though the query succeeds. Derive it from the HAL format
+    * instead, which is what the legacy backends always did.
+    */
+   if (fourcc == 0) {
+      int derived = get_fourcc_from_hal_format(hnd->hal_format);
+      if (derived == -1) {
+         mesa_logw("aimapper: no fourcc from mapper and none for hal_format %d",
+                   hnd->hal_format);
+         return -EINVAL;
+      }
+      fourcc = (uint32_t) derived;
+   }
+
    out->drm_fourcc = fourcc;
 
    uint64_t modifier = 0;
@@ -286,6 +301,32 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
    }
 
    out->num_planes = (int)num_planes;
+
+   /* QTI's mapper describes a UBWC buffer as TWO planes with the metadata plane
+    * FIRST in the allocation (offset 0) and the pixel data after it, while
+    * reporting modifier LINEAR regardless. Mesa's generic path then rejects the
+    * buffer as disjoint, because it treats any plane n>0 sitting at offset 0 as
+    * a separate allocation (vk_android.c vk_gralloc_to_drm_explicit_layout).
+    *
+    * Observed on an A840, 1216x2688 RGBA8888:
+    *   plane[0] offset=86016 stride=4864   <- data (4864 = 1216 * 4)
+    *   plane[1] offset=0     stride=128    <- UBWC metadata (128 * 672 = 86016)
+    *
+    * Collapse it to the single-plane compressed description the legacy backends
+    * produced and that Turnip already lays out correctly for itself.
+    */
+   if (num_planes == 2 && out->offsets[1] == 0 && out->offsets[0] > 0 &&
+       out->strides[1] < out->strides[0]) {
+      mesa_logi("aimapper: UBWC layout detected (meta stride=%d @0, data "
+                "stride=%d @%d) - collapsing to 1 compressed plane",
+                out->strides[1], out->strides[0], out->offsets[0]);
+      out->offsets[0] = 0;
+      out->offsets[1] = 0;
+      out->strides[1] = 0;
+      out->num_planes = 1;
+      num_planes = 1;
+      out->modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+   }
 
    /* Plane layouts carry no fds. Mirror the other backends: one fd shared by
     * every plane, or one fd per plane when the handle provides them.

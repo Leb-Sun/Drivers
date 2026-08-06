@@ -29,7 +29,9 @@ Applied to every variant via `EXTRA_SCRIPT`; both are device-confirmed on an Adr
   `0x200` where the Adreno driver asks for `0x10000200`, so gralloc allocated linear swapchain
   buffers. Adds the QTI vendor usage bit, scoped to the allocation query only. The backend also
   collapses QTI's two-plane UBWC description (metadata plane first) into the single compressed plane
-  Mesa expects, since the generic path otherwise rejects it as disjoint.
+  Mesa expects, since the generic path otherwise rejects it as disjoint. Compression is detected via
+  the standard `StandardMetadataType::COMPRESSION` query (QTI reports `name="QTI" value=10`), with
+  the plane-layout signature kept as a fallback for vendors that do not populate it.
 
 Together these make vendor display features that consume the app's swapchain - RedMagic GameSpace
 upscaling and frame generation - work under Turnip.

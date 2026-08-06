@@ -68,6 +68,7 @@ typedef struct AIMapper {
 /* StandardMetadataType.aidl */
 #define SMT_PIXEL_FORMAT_FOURCC  7
 #define SMT_PIXEL_FORMAT_MODIFIER 8
+#define SMT_COMPRESSION          12
 #define SMT_CHROMA_SITING        14
 #define SMT_PLANE_LAYOUTS        15
 #define SMT_DATASPACE            17
@@ -126,6 +127,25 @@ md_i64(struct md_reader *r)
    return v;
 }
 
+/* Copies a length-prefixed string out, NUL-terminated and truncated to fit. */
+static void
+md_take_str(struct md_reader *r, char *out, size_t out_size)
+{
+   int64_t len = md_i64(r);
+   if (len < 0 || len > (r->end - r->p)) {
+      r->ok = false;
+      if (out_size)
+         out[0] = '\0';
+      return;
+   }
+   size_t copy = (size_t) len < out_size - 1 ? (size_t) len : out_size - 1;
+   if (out_size) {
+      memcpy(out, r->p, copy);
+      out[copy] = '\0';
+   }
+   md_take(r, NULL, (size_t) len);
+}
+
 /* Skips a length-prefixed string. */
 static void
 md_skip_str(struct md_reader *r)
@@ -177,6 +197,30 @@ md_scalar(struct aimapper_gralloc *gr, const native_handle_t *handle,
 /* ---------------------------------------------------------------------------
  * ops
  * --------------------------------------------------------------------------- */
+
+/* Reads StandardMetadataType::COMPRESSION, an ExtendableType (name + value).
+ * Returns true if the mapper answered, filling name/value. This is the standard,
+ * vendor-neutral way to ask whether a buffer is compressed - preferable to
+ * inferring it from the plane layout, provided the vendor actually populates it.
+ */
+static bool
+md_compression(struct aimapper_gralloc *gr, const native_handle_t *handle,
+               char *name, size_t name_size, int64_t *value)
+{
+   uint8_t buf[256];
+   int32_t n = md_fetch(gr, handle, SMT_COMPRESSION, buf, sizeof(buf));
+   if (n < 0)
+      return false;
+
+   struct md_reader r = {buf, buf + n, true};
+   if (!md_header(&r, SMT_COMPRESSION))
+      return false;
+
+   md_take_str(&r, name, name_size);
+   *value = md_i64(&r);
+
+   return r.ok;
+}
 
 static int
 aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
@@ -315,10 +359,37 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
     * Collapse it to the single-plane compressed description the legacy backends
     * produced and that Turnip already lays out correctly for itself.
     */
-   if (num_planes == 2 && out->offsets[1] == 0 && out->offsets[0] > 0 &&
-       out->strides[1] < out->strides[0]) {
-      mesa_logi("aimapper: UBWC layout detected (meta stride=%d @0, data "
+   char compr_name[128] = "";
+   int64_t compr_value = 0;
+   bool have_compr = md_compression(gr, hnd->handle, compr_name,
+                                    sizeof(compr_name), &compr_value);
+
+   /* Standard metadata first. "android.hardware.graphics.common.Compression"
+    * with value 0 is NONE; any other name is a vendor compression scheme.
+    */
+   bool compr_says_compressed =
+      have_compr &&
+      (compr_value != 0 ||
+       strcmp(compr_name,
+              "android.hardware.graphics.common.Compression") != 0);
+
+   /* Fallback: QTI's mapper has already been observed lying about this buffer
+    * (modifier=LINEAR, fourcc=0 on a demonstrably UBWC allocation), so if the
+    * standard query is unhelpful, fall back to the layout signature.
+    */
+   bool layout_says_ubwc =
+      num_planes == 2 && out->offsets[1] == 0 && out->offsets[0] > 0 &&
+      out->strides[1] < out->strides[0];
+
+   mesa_logi("aimapper: COMPRESSION query have=%d name=\"%s\" value=%" PRId64
+             " -> compressed=%d ; layout_signature=%d",
+             (int) have_compr, compr_name, compr_value,
+             (int) compr_says_compressed, (int) layout_says_ubwc);
+
+   if (compr_says_compressed || layout_says_ubwc) {
+      mesa_logi("aimapper: UBWC via %s (meta stride=%d @0, data "
                 "stride=%d @%d) - collapsing to 1 compressed plane",
+                compr_says_compressed ? "COMPRESSION metadata" : "layout signature",
                 out->strides[1], out->strides[0], out->offsets[0]);
       out->offsets[0] = 0;
       out->offsets[1] = 0;

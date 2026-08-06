@@ -111,25 +111,44 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
        * loader passes create=0x108 (MUTABLE_FORMAT|EXTENDED_USAGE), Mesa forces
        * linear, and vendor display features that consume the swapchain fail.
        */
-      const VkImageFormatListCreateInfo *wn_list =
-         vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
-
       if ((image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-          (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY) &&
-          wn_list && wn_list->viewFormatCount > 0) {
+          (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY)) {
+         /* Android's loader does NOT forward VkImageFormatListCreateInfo into
+          * this query - swapchain.cpp walks the swapchain pNext chain but keeps
+          * only IMAGE_COMPRESSION_CONTROL_EXT ("Ignore all other info structs").
+          * So the view formats upstream's XXX wants are not visible here.
+          *
+          * Check the list when a caller does provide one; otherwise allow UBWC.
+          * Justification: Vulkan requires mutable view formats to be
+          * texel-block-size compatible, the loader only sets this flag for
+          * swapchains, and the Adreno blob demonstrably allows UBWC here -
+          * Eden (mutable swapchain) works on the blob and fails on stock Turnip.
+          *
+          * Risk, stated plainly: if an app's view formats need different UBWC
+          * handling this corrupts rather than fails cleanly. Watch for visual
+          * artefacts, not just for the absence of a green screen.
+          */
+         const VkImageFormatListCreateInfo *wn_list =
+            vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+
          bool wn_same_layout = true;
-         for (uint32_t wn_i = 0; wn_i < wn_list->viewFormatCount; wn_i++) {
-            if (vk_format_srgb_to_linear(wn_list->pViewFormats[wn_i]) !=
-                vk_format_srgb_to_linear(info->format)) {
-               wn_same_layout = false;
-               break;
+         if (wn_list && wn_list->viewFormatCount > 0) {
+            for (uint32_t wn_i = 0; wn_i < wn_list->viewFormatCount; wn_i++) {
+               if (vk_format_srgb_to_linear(wn_list->pViewFormats[wn_i]) !=
+                   vk_format_srgb_to_linear(info->format)) {
+                  wn_same_layout = false;
+                  break;
+               }
             }
          }
+
          if (wn_same_layout)
             wn_ahb_usage &= ~(uint64_t) AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
 
-         mesa_logi("WN-MUTABLE: %u view formats, same UBWC layout=%d -> %s",
-                   wn_list->viewFormatCount, (int) wn_same_layout,
+         mesa_logi("WN-MUTABLE: list=%d count=%u same_layout=%d -> %s",
+                   (int) (wn_list != NULL),
+                   wn_list ? wn_list->viewFormatCount : 0u,
+                   (int) wn_same_layout,
                    wn_same_layout ? "allowing UBWC" : "keeping LINEAR");
       }
 

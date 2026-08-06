@@ -102,6 +102,49 @@ edit(
     "inttypes include (already added by the usage34 patch)",
 )
 
+# --- 1b. distinguish the three INVALID_EXTERNAL_HANDLE returns ---------------
+# All three produce the same VkResult, so without this we cannot tell a decoder
+# failure from a plane-count rejection from the disjoint-plane bail-out.
+edit(
+    VK_ANDROID,
+    """   if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   if (info.num_planes > max_planes)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;""",
+    """   if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0) {
+      mesa_logw("WN-ANB-LAYOUT: basic_info FAILED (hal_fmt=%d stride=%d)",
+                in_hnd->hal_format, in_hnd->pixel_stride);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   mesa_logi("WN-ANB-LAYOUT: basic_info ok fourcc=0x%x modifier=0x%" PRIx64
+             " planes=%d max=%d",
+             info.drm_fourcc, info.modifier, info.num_planes, max_planes);
+
+   if (info.num_planes > max_planes) {
+      mesa_logw("WN-ANB-LAYOUT: REJECT num_planes=%d > max=%d",
+                info.num_planes, max_planes);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }""",
+    "basic_info + plane count logging",
+)
+
+edit(
+    VK_ANDROID,
+    """   if (is_disjoint) {
+      /* We don't support disjoint planes yet */
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }""",
+    """   if (is_disjoint) {
+      /* We don't support disjoint planes yet */
+      mesa_logw("WN-ANB-LAYOUT: REJECT disjoint planes (n=%d off[1]=%d)",
+                info.num_planes, info.num_planes > 1 ? info.offsets[1] : -1);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }""",
+    "disjoint plane logging",
+)
+
 # --- 2. tu_image_init result + computed size, and the memory import ----------
 edit(
     TU_IMAGE,

@@ -185,8 +185,10 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
 {
    struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
 
-   if (!hnd->handle)
+   if (!hnd->handle) {
+      mesa_logw("aimapper: FAIL null handle");
       return -EINVAL;
+   }
 
    uint32_t fourcc = 0;
    if (!md_scalar(gr, hnd->handle, SMT_PIXEL_FORMAT_FOURCC, &fourcc,
@@ -225,16 +227,22 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
    struct md_reader r = {NULL, NULL, false};
 
    buf = MALLOC(need);
-   if (!buf)
+   if (!buf) {
+      mesa_logw("aimapper: FAIL malloc %d", need);
       return -ENOMEM;
+   }
 
    got = md_fetch(gr, hnd->handle, SMT_PLANE_LAYOUTS, buf, need);
-   if (got < 0)
+   if (got < 0) {
+      mesa_logw("aimapper: FAIL PLANE_LAYOUTS fetch (need=%d got=%d)", need, got);
       goto out_free;
+   }
 
    r = (struct md_reader){buf, buf + got, true};
-   if (!md_header(&r, SMT_PLANE_LAYOUTS))
+   if (!md_header(&r, SMT_PLANE_LAYOUTS)) {
+      mesa_logw("aimapper: FAIL PLANE_LAYOUTS header framing (%d bytes)", got);
       goto out_free;
+   }
 
    num_planes = md_i64(&r);
    if (!r.ok || num_planes <= 0 || num_planes > 4) {
@@ -244,8 +252,11 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
 
    for (int64_t i = 0; i < num_planes && r.ok; i++) {
       int64_t num_components = md_i64(&r);
-      if (!r.ok || num_components < 0 || num_components > 16)
+      if (!r.ok || num_components < 0 || num_components > 16) {
+         mesa_logw("aimapper: FAIL plane %" PRId64 " component count %" PRId64
+                   " (ok=%d)", i, num_components, (int) r.ok);
          goto out_free;
+      }
 
       for (int64_t j = 0; j < num_components && r.ok; j++) {
          md_skip_str(&r);   /* component type name */
@@ -263,11 +274,15 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
       md_i64(&r);                            /* horizontalSubsampling */
       md_i64(&r);                            /* verticalSubsampling */
 
-      if (!r.ok)
+      if (!r.ok) {
+         mesa_logw("aimapper: FAIL plane %" PRId64 " field decode ran short", i);
          goto out_free;
+      }
 
       out->offsets[i] = (int)offset_bytes;
       out->strides[i] = (int)stride_bytes;
+      mesa_logi("aimapper: plane[%" PRId64 "] offset=%" PRId64
+                " stride=%" PRId64, i, offset_bytes, stride_bytes);
    }
 
    out->num_planes = (int)num_planes;
@@ -275,8 +290,10 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
    /* Plane layouts carry no fds. Mirror the other backends: one fd shared by
     * every plane, or one fd per plane when the handle provides them.
     */
-   if (hnd->handle->numFds == 0)
+   if (hnd->handle->numFds == 0) {
+      mesa_logw("aimapper: FAIL handle has no fds");
       goto out_free;
+   }
 
    if (hnd->handle->numFds >= num_planes) {
       for (int64_t i = 0; i < num_planes; i++)
@@ -287,6 +304,10 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
    }
 
    ret = 0;
+   mesa_logi("aimapper: OK fourcc=0x%x modifier=0x%" PRIx64 " planes=%d "
+             "hal_fmt=%d pixel_stride=%d",
+             out->drm_fourcc, out->modifier, out->num_planes,
+             hnd->hal_format, hnd->pixel_stride);
 
 out_free:
    FREE(buf);

@@ -19,7 +19,7 @@ cd "$SCRIPT_DIR"
 
 export BUILD_VERSION="${BUILD_VERSION:-1.0}"
 export EXTRA_PATCH=""
-export EXTRA_SCRIPT="patches/fix_gralloc_flushall.py:patches/fix_a8xx_dev_info.py:patches/apply_a8xx_gpus.py:patches/apply_a7xx_gen1_quirks.py:patches/apply_a7xx_gen2_ubwc_hint.py:patches/disable_64b_image_atomics.py:patches/add_aimapper_gralloc.py:patches/add_anb_gralloc_usage34.py"
+export EXTRA_SCRIPT="patches/fix_gralloc_flushall.py:patches/fix_a8xx_dev_info.py:patches/apply_a8xx_gpus.py:patches/apply_a7xx_gen1_quirks.py:patches/apply_a7xx_gen2_ubwc_hint.py:patches/disable_64b_image_atomics.py:patches/add_aimapper_gralloc.py:patches/add_anb_gralloc_usage34.py:patches/add_ubwc_swapchain_usage.py:patches/add_anb_diagnostics.py"
 
 read -ra variants <<< "${BUILD_VARIANTS:-b e p}"
 

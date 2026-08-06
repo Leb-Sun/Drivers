@@ -22,6 +22,8 @@ All `patches/*.py` are idempotent and safe to re-run.
 | `apply_a7xx_gen1_quirks.py` | `a7xx_gen1` GPUProps | **needed** | Forces `has_early_preamble/has_scalar_predicates=False` for A720/725/730. |
 | `apply_a7xx_gen2_ubwc_hint.py` | X1-85 / FD740 add_gpus block | **needed** | Adds `enable_tp_ubwc_flag_hint`. That block still lacks it upstream. |
 | `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **retired — not in `EXTRA_SCRIPT`** | Kept on disk as a one-line revert. See below. |
+| `add_aimapper_gralloc.py` | new file + `u_gralloc.c` selection table, `u_gralloc.h` enum, `u_gralloc_internal.h`, `meson.build` | **needed** | IMapper5 backend via SP-HAL. Anchors are small additive edits; if `u_gralloc` is restructured upstream, re-diff the selection table. |
+| `add_ubwc_swapchain_usage.py` | `vk_android.c` `vk_android_get_ahb_image_properties()` `if (ahb_usage)` block | **needed** | QTI UBWC usage bit. **Must stay scoped to that block** - putting it in `vk_image_usage_to_ahb_usage()` breaks AHB *import* validation for every linear buffer. |
 | `apply_balance_variant.py` (-b) | `tu_autotune.cc` drawcall + bandwidth | **partial** | Only the `*11→*10` bandwidth tweak lands; the `> 5` drawcall anchor was **removed upstream** (now `>= 10`) and is skipped. |
 | `apply_perf_variant.py` (-p) | `tu_autotune.cc` + `tu_knl_kgsl.cc` PWR_MAX | **needed** | KGSL PWR_MAX clock-forcing anchors all present. Same autotune drawcall skip as -b. |
 
@@ -52,7 +54,7 @@ All `patches/*.py` are idempotent and safe to re-run.
 
 ## Re-verifying on a mesa bump
 1. `BUILD_VERSION=<ver> ./build_wn_turnip.sh` (clones latest main, applies patches).
-2. Read `build_log_{b,p}.txt`: every script should print an "applied" or an explicit
+2. Read `build_log_{b,e,p}.txt`: every script should print an "applied" or an explicit
    "already/absent/skipping" line. A bare/missing line or a `WARNING:` means an anchor
    drifted — re-diff that script against current upstream before shipping.
 3. Update the table above with the new mesa hash.
@@ -66,10 +68,14 @@ yet it floors at `1.03`. So `1.02` released → next `1.03`, `1.09` → `1.10`, 
 
 The CI (`.github/workflows/build.yml`):
 - **Weekly schedule** (`cron: '0 12 * * 3'`, Wednesdays 12:00 UTC, first run
-  2026-07-08) builds `-b`/`-p` from latest mesa main and **tags + releases** the
+  2026-07-08) builds `-b`/`-e`/`-p` from latest mesa main and **tags + releases** the
   bumped version. Runs every week regardless of whether this repo changed, since
   mesa main advances on its own.
-- **`workflow_dispatch`** does the same on demand.
+- **`workflow_dispatch`** takes two extra inputs:
+  - `variants` (default `b p`) — build a subset for faster driver-tuning iteration.
+  - `publish` (default **false**) — when false, produces artifacts labelled
+    `<ver>-test` and **never tags or releases**. Set true to cut an actual release.
+    Screening builds should always leave this false.
 - **PR / push** build a preview label only — never tag, never release.
 
 Local builds set the label directly, e.g. `BUILD_VERSION=1.03 ./build_wn_turnip.sh`.

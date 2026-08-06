@@ -1,6 +1,6 @@
 # WinNative Turnip Drivers
 
-A unified [Turnip](https://docs.mesa3d.org/drivers/freedreno.html) Vulkan driver build for **all Adreno GPUs on Android**, packaged as Adrenotools-compatible `.zip` archives. The build script always pulls upstream Mesa main, applies the patches in `patches/`, and produces two flavours of the same `libvulkan_freedreno.so`.
+A unified [Turnip](https://docs.mesa3d.org/drivers/freedreno.html) Vulkan driver build for **all Adreno GPUs on Android**, packaged as Adrenotools-compatible `.zip` archives. The build script always pulls upstream Mesa main, applies the patches in `patches/`, and produces three flavours of the same `libvulkan_freedreno.so`.
 
 ## Variants
 
@@ -15,6 +15,24 @@ Each archive ships:
 libvulkan_freedreno.so
 meta.json
 ```
+
+## Android display fixes (all variants)
+
+Applied to every variant via `EXTRA_SCRIPT`; both are device-confirmed on an Adreno 840 / Android 16.
+
+- **IMapper5 gralloc backend** (`add_aimapper_gralloc.py`). A driver loaded into an app process
+  cannot link `libui`, so Mesa's IMapper backends are gated out and `u_gralloc` falls back to
+  `u_gralloc_fallback.c` - no YCbCr support, UBWC guessed from a private handle offset. This reaches
+  the vendor mapper directly through `android_load_sphal_library()` + `AIMapper_loadIMapper()`,
+  needing only `dlopen`/`dlsym`.
+- **UBWC swapchain buffers** (`add_ubwc_swapchain_usage.py`). Turnip asked the Android loader for
+  `0x200` where the Adreno driver asks for `0x10000200`, so gralloc allocated linear swapchain
+  buffers. Adds the QTI vendor usage bit, scoped to the allocation query only. The backend also
+  collapses QTI's two-plane UBWC description (metadata plane first) into the single compressed plane
+  Mesa expects, since the generic path otherwise rejects it as disjoint.
+
+Together these make vendor display features that consume the app's swapchain - RedMagic GameSpace
+upscaling and frame generation - work under Turnip.
 
 ## Supported GPUs
 

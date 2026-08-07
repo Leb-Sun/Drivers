@@ -16,18 +16,21 @@ All `patches/*.py` are idempotent and safe to re-run.
 
 | Script | Target / anchor | Status | Notes |
 |--------|-----------------|--------|-------|
-| `fix_gralloc_flushall.py` | `u_gralloc_fallback.c` gmsm block | **needed** | UBWC detection for newer Qualcomm gralloc. Anchor present. |
 | `fix_a8xx_dev_info.py` | `freedreno_dev_info.h` `disable_gmem` prop + `tu_cmd_buffer.cc` no_gmem check | **needed** | Upstream has render-pass-scoped `disable_gmem`, but **no per-GPU** flag. Anchor `bool has_image_processing;` present. The injected block picks its reason field from `REASON_FIELDS` — upstream renamed `tu_render_pass_state::gmem_disable_reason` to `force_render_mode_reason` after 2026-08-26 and the old hardcoded name broke the build. |
 | `apply_a8xx_gpus.py` | `freedreno_devices.py` A810 / A829 / A825 | **needed** | A810+A829 get `disable_gmem=True` + KGSL chip_ids; **A825 not upstream** (fully injected). |
 | `apply_a7xx_gen1_quirks.py` | `a7xx_gen1` GPUProps | **needed** | Forces `has_early_preamble/has_scalar_predicates=False` for A720/725/730. |
 | `apply_a7xx_gen2_ubwc_hint.py` | X1-85 / FD740 add_gpus block | **needed** | Adds `enable_tp_ubwc_flag_hint`. That block still lacks it upstream. |
 | `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **retired — not in `EXTRA_SCRIPT`** | Kept on disk as a one-line revert. See below. |
 | `add_aimapper_gralloc.py` | new file + `u_gralloc.c` selection table, `u_gralloc.h` enum, `u_gralloc_internal.h`, `meson.build` | **needed** | IMapper5 backend via SP-HAL. Anchors are small additive edits; if `u_gralloc` is restructured upstream, re-diff the selection table. |
-| `add_ubwc_swapchain_usage.py` | `vk_android.c` `vk_android_get_ahb_image_properties()` `if (ahb_usage)` block | **needed** | QTI UBWC usage bit. **Must stay scoped to that block** - putting it in `vk_image_usage_to_ahb_usage()` breaks AHB *import* validation for every linear buffer. |
+| `add_ubwc_swapchain_usage.py` | `vk_android.c` `vk_android_get_ahb_image_properties()` `if (ahb_usage)` block; `vk_physical_device.h` struct tail; `tu_device.cc` after `supported_sync_types` | **needed** | UBWC usage bit + mutable-format gate. Vendor value and gate are **driver-set** (`ahb_vendor_usage_compressed`, `mutable_format_compression_compatible`) - no Qualcomm constant in shared code. **Must stay scoped to the `if (ahb_usage)` block** - putting it in `vk_image_usage_to_ahb_usage()` breaks AHB *import* validation for every linear buffer. |
 | `apply_balance_variant.py` (-b) | `tu_autotune.cc` drawcall + bandwidth | **partial** | Only the `*11→*10` bandwidth tweak lands; the `> 5` drawcall anchor was **removed upstream** (now `>= 10`) and is skipped. |
 | `apply_perf_variant.py` (-p) | `tu_autotune.cc` + `tu_knl_kgsl.cc` PWR_MAX | **needed** | KGSL PWR_MAX clock-forcing anchors all present. Same autotune drawcall skip as -b. |
 
 ### Absorbed / removed by upstream (do NOT re-add)
+- **`fix_gralloc_flushall.py`** — removed 2026-08-07. It patched `u_gralloc_fallback.c`,
+  which `add_aimapper_gralloc.py` makes unreachable: the AIMapper backend is selected first
+  (device log `Using IMapper v5 stable-C API via SP-HAL`), so the fallback never runs. Kept
+  only as build fragility — a missing anchor in an unused file would have failed the build.
 - **`TU_DEBUG_FLUSHALL` forced for gen8** — upstream removed the forced flush from
   `tu_device.cc`. The old `fix_gralloc_flushall.py` half that stripped it is gone.
 - **Autotune `drawcall_count > 5` gate** — restructured upstream to `>= 10`. The -b/-p

@@ -86,7 +86,6 @@ Adrenotools-aware launchers (e.g. WinNative, Winlator) can import each `.zip` di
 ├── build_wn_turnip.sh        # entrypoint: builds both -b and -p
 ├── build_turnip.sh           # core cross-compile engine (do not call directly)
 ├── patches/
-│   ├── fix_gralloc_flushall.py
 │   ├── fix_a8xx_dev_info.py
 │   ├── apply_a8xx_gpus.py
 │   ├── apply_a7xx_gen1_quirks.py

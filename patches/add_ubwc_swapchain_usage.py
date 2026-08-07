@@ -38,9 +38,11 @@ WHERE THE VALUE ACTUALLY COMES FROM
        decision to gralloc."
 
 GATING
-    0x10000000 is in AIDL BufferUsage's VENDOR_MASK (bits 28-31) and means
-    whatever each vendor decides. This build contains only freedreno
-    (-Dvulkan-drivers=freedreno), so the bit can only ever be emitted by Turnip.
+    The vendor bit is NOT hardcoded here. vk_android.c is shared by every Mesa
+    Vulkan driver, so a Qualcomm constant does not belong in it. The value comes
+    from vk_physical_device::ahb_vendor_usage_compressed, which Turnip sets to
+    0x10000000 (AIDL BufferUsage VENDOR_MASK, bits 28-31); drivers that leave it
+    zero add nothing and are unaffected.
 
     Additionally skipped whenever any CPU usage bit is set: gralloc cannot give
     a CPU-mappable UBWC buffer.
@@ -72,26 +74,6 @@ import sys
 VK_ANDROID = "src/vulkan/runtime/vk_android.c"
 VK_PHYS_DEV_H = "src/vulkan/runtime/vk_physical_device.h"
 TU_DEVICE = "src/freedreno/vulkan/tu_device.cc"
-
-DEFINE = """
-/* WN-Turnip: Qualcomm private gralloc/AHardwareBuffer usage bit requesting a
- * UBWC-compressed allocation. Confirmed by observation - every buffer on an
- * A840 carrying this bit is reported "compressed: true" by SurfaceFlinger and
- * is sized with a UBWC metadata plane; the one buffer without it is exactly
- * w*h*4 and uncompressed. Lives in AIDL BufferUsage's VENDOR_MASK, so it is
- * only ever emitted from this freedreno-only build.
- */
-#define WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC 0x10000000ull
-
-"""
-
-ANCHOR_DEFINE = """/* Construct ahw usage mask from image usage bits, see
- * 'AHardwareBuffer Usage Equivalence' in Vulkan spec.
- */
-uint64_t
-vk_image_usage_to_ahb_usage("""
-
-NEW_DEFINE = DEFINE + ANCHOR_DEFINE
 
 # CRITICAL SCOPING - do NOT move this into vk_image_usage_to_ahb_usage().
 #
@@ -157,7 +139,7 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
        */
       if (!(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
                             AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
-         wn_ahb_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
+         wn_ahb_usage |= pdevice->ahb_vendor_usage_compressed;
 
       ahb_usage->androidHardwareBufferUsage = wn_ahb_usage;"""
 
@@ -174,6 +156,13 @@ NEW_PDEV = """   const struct vk_pipeline_cache_object_ops *const *pipeline_cach
     * Drivers that cannot guarantee this must leave it false.
     */
    bool mutable_format_compression_compatible;
+
+   /** Vendor AHardwareBuffer usage bit requesting a compressed allocation
+    *
+    * Meaningful only to the platform gralloc. Zero if the driver has none, in
+    * which case nothing is added to the usage handed to the Android loader.
+    */
+   uint64_t ahb_vendor_usage_compressed;
 };"""
 
 ANCHOR_TU = """   device->vk.supported_sync_types = device->sync_types;"""
@@ -181,7 +170,13 @@ ANCHOR_TU = """   device->vk.supported_sync_types = device->sync_types;"""
 NEW_TU = """   device->vk.supported_sync_types = device->sync_types;
 
    device->vk.mutable_format_compression_compatible =
-      device->info->props.ubwc_all_formats_compatible;"""
+      device->info->props.ubwc_all_formats_compatible;
+
+   /* Qualcomm gralloc reads this from AIDL BufferUsage's VENDOR_MASK (bits
+    * 28-31) as "allocate UBWC-compressed". Confirmed on a840: every buffer
+    * carrying it is reported compressed and is sized with a metadata plane.
+    */
+   device->vk.ahb_vendor_usage_compressed = 0x10000000ull;"""
 
 failed = False
 
@@ -209,7 +204,6 @@ def edit(path, old, new, what):
     print(f"  {path}: {what} applied")
 
 
-edit(VK_ANDROID, ANCHOR_DEFINE, NEW_DEFINE, "usage bit define")
 edit(VK_ANDROID, ANCHOR_AHB, NEW_AHB, "AHB usage (the live loader path)")
 edit(VK_PHYS_DEV_H, ANCHOR_PDEV, NEW_PDEV, "vk_physical_device gate field")
 edit(TU_DEVICE, ANCHOR_TU, NEW_TU, "turnip sets the gate from fd_dev_info")

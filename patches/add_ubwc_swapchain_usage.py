@@ -43,9 +43,26 @@ GATING
     (-Dvulkan-drivers=freedreno), so the bit can only ever be emitted by Turnip.
 
     Additionally skipped whenever any CPU usage bit is set: gralloc cannot give
-    a CPU-mappable UBWC buffer, and vk_image_usage_to_ahb_usage() deliberately
-    sets CPU_WRITE_RARELY for MUTABLE_FORMAT images specifically to force LINEAR
-    (see mesa d02b2515). Asking for both would be contradictory.
+    a CPU-mappable UBWC buffer.
+
+MUTABLE_FORMAT SWAPCHAINS
+    vk_image_usage_to_ahb_usage() sets CPU_WRITE_RARELY for MUTABLE_FORMAT
+    images specifically to force LINEAR (mesa d02b2515), which would suppress
+    the bit for apps like Eden that create a mutable swapchain.
+
+    Upstream's XXX asks for the view-format list to be forwarded so gralloc can
+    decide. That cannot be done from here: Android's loader holds the list but
+    never passes it to this query (getProducerUsage() chains only
+    VkPhysicalDeviceExternalImageFormatInfo; CreateSwapchainKHR keeps the list
+    for the later vkCreateImage). Device-proved - it is always absent.
+
+    Gated on the device instead. Where the hardware reports every format
+    compression-compatible, no view format can change the layout, so the absent
+    list cannot alter the answer and forcing LINEAR buys nothing. Turnip sets
+    the new vk_physical_device flag from fd_dev_info::ubwc_all_formats_compatible
+    (true from a7xx_gen3, which a840 inherits); tu_image.cc:604 applies the same
+    rule, NV12 exception included, when it decides whether a mutable image keeps
+    UBWC. On hardware without the property this now correctly keeps LINEAR.
 
 Idempotent. Three states per MAINTENANCE.md.
 """
@@ -53,6 +70,8 @@ import os
 import sys
 
 VK_ANDROID = "src/vulkan/runtime/vk_android.c"
+VK_PHYS_DEV_H = "src/vulkan/runtime/vk_physical_device.h"
+TU_DEVICE = "src/freedreno/vulkan/tu_device.cc"
 
 DEFINE = """
 /* WN-Turnip: Qualcomm private gralloc/AHardwareBuffer usage bit requesting a
@@ -99,21 +118,70 @@ ANCHOR_AHB = """      ahb_usage->androidHardwareBufferUsage =
 NEW_AHB = """      uint64_t wn_ahb_usage =
          vk_image_usage_to_ahb_usage(image_flags, image_usage);
 
-      /* WN-Turnip: ask gralloc for UBWC. Reaching this block means the caller
-       * chained VkAndroidHardwareBufferUsageANDROID on the output, i.e. it is
-       * asking what to ALLOCATE with - which is the Android loader sizing up a
-       * swapchain buffer. Import-validation paths never chain it, so they keep
-       * the unmodified requirement and can still accept linear buffers.
+      /* WN-Turnip: MUTABLE_FORMAT images get CPU_WRITE_RARELY added by
+       * vk_image_usage_to_ahb_usage() purely to force LINEAR. Upstream's XXX
+       * there asks for the view-format list so gralloc can decide - but
+       * Android's loader never forwards it to this query: getProducerUsage()
+       * holds the VkSwapchainCreateInfoKHR yet builds its
+       * VkPhysicalDeviceImageFormatInfo2 chaining only
+       * VkPhysicalDeviceExternalImageFormatInfo, and CreateSwapchainKHR keeps
+       * the list solely for the later vkCreateImage. Device-proved: the list is
+       * always absent here (WN-MUTABLE logged list=0).
        *
-       * Skipped when CPU access is implied: gralloc cannot hand back a
-       * CPU-mappable UBWC buffer, and the MUTABLE_FORMAT case deliberately sets
-       * CPU_WRITE_RARELY to force LINEAR (mesa d02b2515).
+       * So gate on the device instead. When the hardware reports every format
+       * compression-compatible, no view format can change the layout and
+       * forcing LINEAR buys nothing - the missing list cannot alter the answer.
+       * This is the same rule tu_image.cc:604 applies when deciding whether to
+       * keep UBWC on a mutable image, including its NV12 exception (the Y
+       * channel uses a compression scheme that cannot be reinterpreted).
+       */
+      if ((image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+          (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY)) {
+         bool wn_is_nv12 =
+            info->format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+         bool wn_allow =
+            !wn_is_nv12 && pdevice->mutable_format_compression_compatible;
+
+         if (wn_allow)
+            wn_ahb_usage &= ~(uint64_t) AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+      }
+
+      /* Reaching this block means the caller chained
+       * VkAndroidHardwareBufferUsageANDROID on the output, i.e. it is asking
+       * what to ALLOCATE with - the Android loader sizing up a swapchain
+       * buffer. Import-validation paths never chain it, so they keep the
+       * unmodified requirement and can still accept linear buffers.
+       *
+       * Still skipped when CPU access is genuinely implied: gralloc cannot hand
+       * back a CPU-mappable UBWC buffer.
        */
       if (!(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
                             AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
          wn_ahb_usage |= WN_GRALLOC_USAGE_QCOM_ALLOC_UBWC;
 
       ahb_usage->androidHardwareBufferUsage = wn_ahb_usage;"""
+
+
+ANCHOR_PDEV = """   const struct vk_pipeline_cache_object_ops *const *pipeline_cache_import_ops;
+};"""
+
+NEW_PDEV = """   const struct vk_pipeline_cache_object_ops *const *pipeline_cache_import_ops;
+
+   /** True if any two format-compatible formats share a compressed layout
+    *
+    * When set, a MUTABLE_FORMAT image needs no VkImageFormatListCreateInfo to
+    * decide whether compression is safe - no view format can change the layout.
+    * Drivers that cannot guarantee this must leave it false.
+    */
+   bool mutable_format_compression_compatible;
+};"""
+
+ANCHOR_TU = """   device->vk.supported_sync_types = device->sync_types;"""
+
+NEW_TU = """   device->vk.supported_sync_types = device->sync_types;
+
+   device->vk.mutable_format_compression_compatible =
+      device->info->props.ubwc_all_formats_compatible;"""
 
 failed = False
 
@@ -143,6 +211,8 @@ def edit(path, old, new, what):
 
 edit(VK_ANDROID, ANCHOR_DEFINE, NEW_DEFINE, "usage bit define")
 edit(VK_ANDROID, ANCHOR_AHB, NEW_AHB, "AHB usage (the live loader path)")
+edit(VK_PHYS_DEV_H, ANCHOR_PDEV, NEW_PDEV, "vk_physical_device gate field")
+edit(TU_DEVICE, ANCHOR_TU, NEW_TU, "turnip sets the gate from fd_dev_info")
 
 if failed:
     print("  FATAL: a required anchor was missing", file=sys.stderr)

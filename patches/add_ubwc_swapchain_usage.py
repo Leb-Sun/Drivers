@@ -43,9 +43,26 @@ GATING
     (-Dvulkan-drivers=freedreno), so the bit can only ever be emitted by Turnip.
 
     Additionally skipped whenever any CPU usage bit is set: gralloc cannot give
-    a CPU-mappable UBWC buffer, and vk_image_usage_to_ahb_usage() deliberately
-    sets CPU_WRITE_RARELY for MUTABLE_FORMAT images specifically to force LINEAR
-    (see mesa d02b2515). Asking for both would be contradictory.
+    a CPU-mappable UBWC buffer.
+
+MUTABLE_FORMAT SWAPCHAINS
+    vk_image_usage_to_ahb_usage() sets CPU_WRITE_RARELY for MUTABLE_FORMAT
+    images specifically to force LINEAR (mesa d02b2515), which would suppress
+    the bit for apps like Eden that create a mutable swapchain.
+
+    Upstream's XXX asks for the view-format list to be forwarded so gralloc can
+    decide. That cannot be done from here: Android's loader holds the list but
+    never passes it to this query (getProducerUsage() chains only
+    VkPhysicalDeviceExternalImageFormatInfo; CreateSwapchainKHR keeps the list
+    for the later vkCreateImage). Device-proved - it is always absent.
+
+    Gated on the device instead. Where the hardware reports every format
+    compression-compatible, no view format can change the layout, so the absent
+    list cannot alter the answer and forcing LINEAR buys nothing. Turnip sets
+    the new vk_physical_device flag from fd_dev_info::ubwc_all_formats_compatible
+    (true from a7xx_gen3, which a840 inherits); tu_image.cc:604 applies the same
+    rule, NV12 exception included, when it decides whether a mutable image keeps
+    UBWC. On hardware without the property this now correctly keeps LINEAR.
 
 Idempotent. Three states per MAINTENANCE.md.
 """
@@ -53,6 +70,8 @@ import os
 import sys
 
 VK_ANDROID = "src/vulkan/runtime/vk_android.c"
+VK_PHYS_DEV_H = "src/vulkan/runtime/vk_physical_device.h"
+TU_DEVICE = "src/freedreno/vulkan/tu_device.cc"
 
 DEFINE = """
 /* WN-Turnip: Qualcomm private gralloc/AHardwareBuffer usage bit requesting a
@@ -100,56 +119,39 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
          vk_image_usage_to_ahb_usage(image_flags, image_usage);
 
       /* WN-Turnip: MUTABLE_FORMAT images get CPU_WRITE_RARELY added by
-       * vk_image_usage_to_ahb_usage() purely to force LINEAR - upstream's XXX
-       * there asks for the format list to be forwarded so gralloc can decide
-       * instead. Vulkan already requires mutable view formats to be
-       * texel-block-size compatible; when every view format is the same base
-       * format differing only in sRGB-ness, the UBWC layout is identical and
-       * compression is safe. Recover that case.
+       * vk_image_usage_to_ahb_usage() purely to force LINEAR. Upstream's XXX
+       * there asks for the view-format list so gralloc can decide - but
+       * Android's loader never forwards it to this query: getProducerUsage()
+       * holds the VkSwapchainCreateInfoKHR yet builds its
+       * VkPhysicalDeviceImageFormatInfo2 chaining only
+       * VkPhysicalDeviceExternalImageFormatInfo, and CreateSwapchainKHR keeps
+       * the list solely for the later vkCreateImage. Device-proved: the list is
+       * always absent here (WN-MUTABLE logged list=0).
        *
-       * Observed: Eden (Switch emulator) creates a mutable swapchain, so the
-       * loader passes create=0x108 (MUTABLE_FORMAT|EXTENDED_USAGE), Mesa forces
-       * linear, and vendor display features that consume the swapchain fail.
+       * So gate on the device instead. When the hardware reports every format
+       * compression-compatible, no view format can change the layout and
+       * forcing LINEAR buys nothing - the missing list cannot alter the answer.
+       * This is the same rule tu_image.cc:604 applies when deciding whether to
+       * keep UBWC on a mutable image, including its NV12 exception (the Y
+       * channel uses a compression scheme that cannot be reinterpreted).
        */
       if ((image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
           (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY)) {
-         /* Android's loader does NOT forward VkImageFormatListCreateInfo into
-          * this query - swapchain.cpp walks the swapchain pNext chain but keeps
-          * only IMAGE_COMPRESSION_CONTROL_EXT ("Ignore all other info structs").
-          * So the view formats upstream's XXX wants are not visible here.
-          *
-          * Check the list when a caller does provide one; otherwise allow UBWC.
-          * Justification: Vulkan requires mutable view formats to be
-          * texel-block-size compatible, the loader only sets this flag for
-          * swapchains, and the Adreno blob demonstrably allows UBWC here -
-          * Eden (mutable swapchain) works on the blob and fails on stock Turnip.
-          *
-          * Risk, stated plainly: if an app's view formats need different UBWC
-          * handling this corrupts rather than fails cleanly. Watch for visual
-          * artefacts, not just for the absence of a green screen.
-          */
-         const VkImageFormatListCreateInfo *wn_list =
-            vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+         bool wn_is_nv12 =
+            info->format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+         bool wn_allow =
+            !wn_is_nv12 && pdevice->mutable_format_compression_compatible;
 
-         bool wn_same_layout = true;
-         if (wn_list && wn_list->viewFormatCount > 0) {
-            for (uint32_t wn_i = 0; wn_i < wn_list->viewFormatCount; wn_i++) {
-               if (vk_format_srgb_to_linear(wn_list->pViewFormats[wn_i]) !=
-                   vk_format_srgb_to_linear(info->format)) {
-                  wn_same_layout = false;
-                  break;
-               }
-            }
-         }
-
-         if (wn_same_layout)
+         if (wn_allow)
             wn_ahb_usage &= ~(uint64_t) AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
 
-         mesa_logi("WN-MUTABLE: list=%d count=%u same_layout=%d -> %s",
-                   (int) (wn_list != NULL),
-                   wn_list ? wn_list->viewFormatCount : 0u,
-                   (int) wn_same_layout,
-                   wn_same_layout ? "allowing UBWC" : "keeping LINEAR");
+         /* Logged unconditionally: a silent decline is indistinguishable from
+          * this path never running, which has already cost a debug cycle.
+          */
+         mesa_logi("WN-MUTABLE: all_formats_compatible=%d nv12=%d -> %s",
+                   (int) pdevice->mutable_format_compression_compatible,
+                   (int) wn_is_nv12,
+                   wn_allow ? "allowing UBWC" : "keeping LINEAR");
       }
 
       /* Reaching this block means the caller chained
@@ -169,6 +171,28 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
                 wn_ahb_usage, (unsigned) image_flags, (unsigned) image_usage);
 
       ahb_usage->androidHardwareBufferUsage = wn_ahb_usage;"""
+
+
+ANCHOR_PDEV = """   const struct vk_pipeline_cache_object_ops *const *pipeline_cache_import_ops;
+};"""
+
+NEW_PDEV = """   const struct vk_pipeline_cache_object_ops *const *pipeline_cache_import_ops;
+
+   /** True if any two format-compatible formats share a compressed layout
+    *
+    * When set, a MUTABLE_FORMAT image needs no VkImageFormatListCreateInfo to
+    * decide whether compression is safe - no view format can change the layout.
+    * Drivers that cannot guarantee this must leave it false.
+    */
+   bool mutable_format_compression_compatible;
+};"""
+
+ANCHOR_TU = """   device->vk.supported_sync_types = device->sync_types;"""
+
+NEW_TU = """   device->vk.supported_sync_types = device->sync_types;
+
+   device->vk.mutable_format_compression_compatible =
+      device->info->props.ubwc_all_formats_compatible;"""
 
 failed = False
 
@@ -198,6 +222,8 @@ def edit(path, old, new, what):
 
 edit(VK_ANDROID, ANCHOR_DEFINE, NEW_DEFINE, "usage bit define")
 edit(VK_ANDROID, ANCHOR_AHB, NEW_AHB, "AHB usage (the live loader path)")
+edit(VK_PHYS_DEV_H, ANCHOR_PDEV, NEW_PDEV, "vk_physical_device gate field")
+edit(TU_DEVICE, ANCHOR_TU, NEW_TU, "turnip sets the gate from fd_dev_info")
 
 if failed:
     print("  FATAL: a required anchor was missing", file=sys.stderr)

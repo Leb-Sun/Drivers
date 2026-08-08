@@ -119,6 +119,10 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
        */
       if ((image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
           (wn_ahb_usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY)) {
+         /* More conservative than tu_image.cc, which can still allow UBWC on a
+          * false property if the format list turns out compatible. The list is
+          * unavailable here, so we keep LINEAR. Costs UBWC pre-a7xx_gen3 only.
+          */
          bool wn_is_nv12 =
             info->format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
          bool wn_allow =

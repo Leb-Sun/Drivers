@@ -141,7 +141,22 @@ NEW_AHB = """      uint64_t wn_ahb_usage =
        * Still skipped when CPU access is genuinely implied: gralloc cannot hand
        * back a CPU-mappable UBWC buffer.
        */
-      if (!(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
+      /* VK_EXT_image_compression_control(_swapchain): the Android loader
+       * forwards the application's request into exactly this query - it chains
+       * VkImageCompressionControlEXT onto VkPhysicalDeviceExternalImageFormatInfo
+       * (swapchain.cpp) - so an explicit refusal is visible right here.
+       *
+       * Only DISABLED changes anything. Absent or DEFAULT keeps the driver's own
+       * policy, which matters: apps that never ask (Eden, any unmodified title)
+       * rely on the default to get a compressed swapchain at all.
+       */
+      const VkImageCompressionControlEXT *wn_compr =
+         vk_find_struct_const(info->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+      bool wn_compr_refused =
+         wn_compr && (wn_compr->flags & VK_IMAGE_COMPRESSION_DISABLED_EXT);
+
+      if (!wn_compr_refused &&
+          !(wn_ahb_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
                             AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
          wn_ahb_usage |= pdevice->ahb_vendor_usage_compressed;
 

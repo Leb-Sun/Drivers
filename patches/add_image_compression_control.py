@@ -15,9 +15,18 @@ WHY
     find out what it actually got, instead of the driver deciding unilaterally.
 
 SCOPE
-    Base extension only. VK_EXT_image_compression_control_swapchain is a
-    separate, larger job: it needs the request plumbed through the ANB/WSI path
-    rather than ordinary vkCreateImage.
+    Both the base extension and _swapchain. The swapchain half needs no WSI work:
+    the loader already chains the app's VkImageCompressionControlEXT onto
+    VkPhysicalDeviceExternalImageFormatInfo for the gralloc-usage query
+    (swapchain.cpp, three sites), which is the same query add_ubwc_swapchain_usage.py
+    already patches - so that script reads the request and skips the vendor
+    compression bit when the app refuses. The two scripts are coupled and the
+    usage one must run first.
+
+    Only DISABLED changes behaviour. Absent or DEFAULT keeps the driver's own
+    policy, deliberately: apps that never ask - Eden, any unmodified title - depend
+    on the default to get a compressed swapchain at all, and making compression
+    opt-in would regress them.
 
     Adreno UBWC is lossless, so no fixed-rate levels are advertised -
     imageCompressionFixedRateFlags is always NONE. Per the spec an application
@@ -45,13 +54,15 @@ ANCHOR_EXT = """      .EXT_image_2d_view_of_3d = true,
       .EXT_image_drm_format_modifier = true,"""
 NEW_EXT = """      .EXT_image_2d_view_of_3d = true,
       .EXT_image_compression_control = true,
+      .EXT_image_compression_control_swapchain = true,
       .EXT_image_drm_format_modifier = true,"""
 
 # ---- 2. advertise the feature ---------------------------------------------
 ANCHOR_FEAT = """   /* VK_EXT_image_2d_view_of_3d  */
    features->image2DViewOf3D = true;"""
-NEW_FEAT = """   /* VK_EXT_image_compression_control */
+NEW_FEAT = """   /* VK_EXT_image_compression_control(_swapchain) */
    features->imageCompressionControl = true;
+   features->imageCompressionControlSwapchain = true;
 
    /* VK_EXT_image_2d_view_of_3d  */
    features->image2DViewOf3D = true;"""

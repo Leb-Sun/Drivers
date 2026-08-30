@@ -75,13 +75,15 @@ def fix_dev_info():
 NO_GMEM_BLOCK = """\
    bool no_gmem = cmd->device->physical_device->dev_info.props.disable_gmem;
    if (no_gmem) {
-       cmd->state.rp.gmem_disable_reason = "Unsupported GPU";
+       cmd->state.rp.__REASON_FIELD__ = "Unsupported GPU";
        return true;
     }
 
 """
 
 NO_GMEM_ANCHOR = "   /* can't fit attachments into gmem */"
+
+REASON_FIELDS = ("force_render_mode_reason", "gmem_disable_reason")
 
 def fix_tu_cmd():
     with open(TU_CMD_CC, "r") as f:
@@ -95,7 +97,14 @@ def fix_tu_cmd():
         print(f"WARNING: anchor not found in {TU_CMD_CC}, skipping no_gmem insertion", file=sys.stderr)
         return
 
-    content = content.replace(NO_GMEM_ANCHOR, NO_GMEM_BLOCK + NO_GMEM_ANCHOR, 1)
+    reason_field = next((f for f in REASON_FIELDS if f"cmd->state.rp.{f}" in content), None)
+    if reason_field is None:
+        print(f"WARNING: no known render-mode reason field in {TU_CMD_CC}, skipping no_gmem insertion", file=sys.stderr)
+        return
+    print(f"{TU_CMD_CC}: using reason field '{reason_field}'")
+
+    block = NO_GMEM_BLOCK.replace("__REASON_FIELD__", reason_field)
+    content = content.replace(NO_GMEM_ANCHOR, block + NO_GMEM_ANCHOR, 1)
     with open(TU_CMD_CC, "w") as f:
         f.write(content)
     print(f"{TU_CMD_CC}: no_gmem check inserted successfully")

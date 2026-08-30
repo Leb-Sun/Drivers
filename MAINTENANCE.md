@@ -12,16 +12,16 @@ tell three states apart and act accordingly:
 
 All `patches/*.py` are idempotent and safe to re-run.
 
-## Patch status — verified against mesa `43094891c9b` (Mesa 26.2.0-devel, 2026-07-01)
+## Patch status — verified against mesa `29c5f0ad445` (Mesa 26.3.0-devel, 2026-08-30)
 
 | Script | Target / anchor | Status | Notes |
 |--------|-----------------|--------|-------|
 | `fix_gralloc_flushall.py` | `u_gralloc_fallback.c` gmsm block | **needed** | UBWC detection for newer Qualcomm gralloc. Anchor present. |
-| `fix_a8xx_dev_info.py` | `freedreno_dev_info.h` `disable_gmem` prop + `tu_cmd_buffer.cc` no_gmem check | **needed** | Upstream has render-pass-scoped `disable_gmem`, but **no per-GPU** flag. Anchor `bool has_image_processing;` present. |
+| `fix_a8xx_dev_info.py` | `freedreno_dev_info.h` `disable_gmem` prop + `tu_cmd_buffer.cc` no_gmem check | **needed** | Upstream has render-pass-scoped `disable_gmem`, but **no per-GPU** flag. Anchor `bool has_image_processing;` present. The injected block picks its reason field from `REASON_FIELDS` — upstream renamed `tu_render_pass_state::gmem_disable_reason` to `force_render_mode_reason` after 2026-08-26 and the old hardcoded name broke the build. |
 | `apply_a8xx_gpus.py` | `freedreno_devices.py` A810 / A829 / A825 | **needed** | A810+A829 get `disable_gmem=True` + KGSL chip_ids; **A825 not upstream** (fully injected). |
 | `apply_a7xx_gen1_quirks.py` | `a7xx_gen1` GPUProps | **needed** | Forces `has_early_preamble/has_scalar_predicates=False` for A720/725/730. |
 | `apply_a7xx_gen2_ubwc_hint.py` | X1-85 / FD740 add_gpus block | **needed** | Adds `enable_tp_ubwc_flag_hint`. That block still lacks it upstream. |
-| `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **needed (workaround)** | UE5/VKD3D-Proton SM6.6 A8xx GPU-hang workaround. See removal criteria below. |
+| `disable_64b_image_atomics.py` | `has_64b_image_atomics = True` (×2, gen2+gen3) | **retired — not in `EXTRA_SCRIPT`** | Kept on disk as a one-line revert. See below. |
 | `apply_balance_variant.py` (-b) | `tu_autotune.cc` drawcall + bandwidth | **partial** | Only the `*11→*10` bandwidth tweak lands; the `> 5` drawcall anchor was **removed upstream** (now `>= 10`) and is skipped. |
 | `apply_perf_variant.py` (-p) | `tu_autotune.cc` + `tu_knl_kgsl.cc` PWR_MAX | **needed** | KGSL PWR_MAX clock-forcing anchors all present. Same autotune drawcall skip as -b. |
 
@@ -32,10 +32,19 @@ All `patches/*.py` are idempotent and safe to re-run.
   scripts skip this tweak cleanly; the two variants now differ by **bandwidth + PWR_MAX**,
   not the drawcall threshold. (Re-target to the new gate only if a split is desired.)
 
+### Retired patches
+- **`disable_64b_image_atomics.py`** — dropped from `EXTRA_SCRIPT` in 1.12. It cleared
+  `has_64b_image_atomics` on `a7xx_gen2` **and** `a7xx_gen3` (which every A8xx inherits),
+  which removes `VK_EXT_shader_image_atomic_int64` / `shaderImageInt64Atomics`. That is the
+  feature upstream added in `5b87bbfad3b` specifically "for SM6.6 in vkd3d-proton", so with
+  it off, VKD3D-Proton reports `Options9.AtomicInt64OnTypedResourceSupported = FALSE` and
+  rejects any pipeline whose DXIL uses typed 64-bit image atomics — Hogwarts Legacy and
+  FF VII Rebirth among them. 1.12-test builds with it removed were confirmed working on
+  device. The script stays on disk: if the A8xx post-submit GPU hang it was written for
+  returns, re-append `:patches/disable_64b_image_atomics.py` to `EXTRA_SCRIPT` in
+  `build_wn_turnip.sh`.
+
 ### Removal criteria to watch on future bumps
-- **`disable_64b_image_atomics.py`**: drop once upstream fixes the A8xx 64-bit image
-  atomic implementation (track follow-ups to `5b87bbfad3b`). Until then, keep — the
-  feature is still advertised `True` on gen2/gen3.
 - **`apply_a8xx_gpus.py` A825 block**: drop the A825 insertion if upstream adds A825
   natively (the script already detects `name="Adreno (TM) 825"` / `FD825` and skips).
 - **`fix_a8xx_dev_info.py`**: if upstream adds a per-device GMEM-disable mechanism,

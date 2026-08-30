@@ -35,7 +35,7 @@ A single driver covers the full Adreno line:
 - Always built from **upstream Mesa main** — every run re-clones, re-patches, re-builds. No pinned forks.
 - Per-chip `disable_gmem` GPU property plumbed through `freedreno_dev_info.h` and `tu_cmd_buffer.cc` for parts with broken GMEM.
 - KGSL UBWC gralloc detection bypass (newer Qualcomm gralloc no longer writes the legacy `gmsm` magic header).
-- A8xx UE5 / VKD3D-Proton SM6.6 freeze workaround — `EXT_shader_image_atomic_int64` advertisement disabled while upstream resolves the underlying 64-bit image atomic implementation.
+- `EXT_shader_image_atomic_int64` advertised as upstream intends, so VKD3D-Proton exposes `AtomicInt64OnTypedResourceSupported` and D3D12 titles needing SM6.6 typed 64-bit atomics (Hogwarts Legacy, FF VII Rebirth) run.
 - Adrenotools-compatible `meta.json` with simple `WN-<version>-<variant>` driver versioning.
 
 ## Build

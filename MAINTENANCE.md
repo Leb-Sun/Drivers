@@ -14,6 +14,14 @@ All `patches/*.py` are idempotent and safe to re-run.
 
 ## Patch status — verified against mesa `d870cef8b7c` (Mesa 26.3.0-devel, 2026-09-02)
 
+**Device-confirmed 2026-09-02** on RedMagic 11 Pro / Adreno 840 / Android 16, with the
+re-anchored patch set built against that mesa: WinNative (GameSpace "Superior Pic Quality" —
+upscaling and frame generation) and Eden both render correctly, unchanged from before the mesa
+bump. Eden is the one that mattered: its mutable-format swapchain is now governed by upstream's
+rule (`491bb61a`/`24c8a889`) rather than the `ubwc_all_formats_compatible` gate we used to ship,
+and the two agree on this hardware as predicted. Log markers were not captured on that run — the
+check was visual.
+
 | Script | Target / anchor | Status | Notes |
 |--------|-----------------|--------|-------|
 | `fix_a8xx_dev_info.py` | `freedreno_dev_info.h` `disable_gmem` prop + `tu_cmd_buffer.cc` no_gmem check | **needed** | Upstream has render-pass-scoped `disable_gmem`, but **no per-GPU** flag. Anchor `bool has_image_processing;` present. The injected block picks its reason field from `REASON_FIELDS` — upstream renamed `tu_render_pass_state::gmem_disable_reason` to `force_render_mode_reason` after 2026-08-26 and the old hardcoded name broke the build. |

@@ -73,6 +73,20 @@ All `patches/*.py` are idempotent and safe to re-run.
   returns, re-append `:patches/disable_64b_image_atomics.py` to `EXTRA_SCRIPT` in
   `build_wn_turnip.sh`.
 
+  **This is a flipped trade, not a resolved bug — treat it as a watch item.** Upstream's
+  device check confirmed the *flag* reports `True` on all 12 A7xx gen2/gen3 and A8xx entries;
+  it did not re-test the hang. Checked against mesa `d870cef8b7c` (2026-09-02): upstream has
+  never added an A8xx-specific override or fix — `has_64b_image_atomics = True` still sits
+  only on `a7xx_gen2` and `a7xx_gen3`, and the only follow-ups to `5b87bbfad3b` are
+  `b7b66d3e` (r64u/i image load/store support) and `7f760b87` (sparse loads in
+  `ir3_nir_lower_64b_image`), neither of which is a hang fix. So the pipeline rejections were
+  judged to cost more than the hang, on the assumption the hang is rare.
+
+  **Symptom to watch for:** a UE5 / D3D12 SM6.6 title freezing on a black screen immediately
+  after vkd3d init. Reanimal is the title it was originally confirmed on (see the script's
+  docstring). If that happens, revert as above and report it upstream — the call was made in
+  `WinNative-Emu/Drivers`, so a regression is theirs to weigh, not something to fork around.
+
 ### Removal criteria to watch on future bumps
 - **`apply_a8xx_gpus.py` A825 block**: drop the A825 insertion if upstream adds A825
   natively (the script already detects `name="Adreno (TM) 825"` / `FD825` and skips).

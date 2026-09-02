@@ -66,8 +66,10 @@ typedef struct AIMapper {
 #define AIMAPPER_VERSION_5 5
 
 /* StandardMetadataType.aidl */
+#define SMT_LAYER_COUNT           5
 #define SMT_PIXEL_FORMAT_FOURCC  7
 #define SMT_PIXEL_FORMAT_MODIFIER 8
+#define SMT_ALLOCATION_SIZE      10
 #define SMT_COMPRESSION          12
 #define SMT_CHROMA_SITING        14
 #define SMT_PLANE_LAYOUTS        15
@@ -403,6 +405,22 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
       for (int64_t i = 0; i < num_planes; i++)
          out->fds[i] = hnd->handle->data[0];
    }
+
+   /* vk_gralloc_to_drm_explicit_layout() derives a multi-layer image's
+    * arrayPitch from alloc_size / layer_count (mesa b3bb742f, d850d2ef). It
+    * only does so when layer_count > 1 && alloc_size > 0, so leaving these at
+    * zero when the mapper declines to answer is safe - it just falls back to
+    * the single-layer path.
+    */
+   uint64_t layer_count = 0;
+   if (md_scalar(gr, hnd->handle, SMT_LAYER_COUNT, &layer_count,
+                 sizeof(layer_count)))
+      out->layer_count = layer_count;
+
+   uint64_t alloc_size = 0;
+   if (md_scalar(gr, hnd->handle, SMT_ALLOCATION_SIZE, &alloc_size,
+                 sizeof(alloc_size)))
+      out->alloc_size = alloc_size;
 
    ret = 0;
 

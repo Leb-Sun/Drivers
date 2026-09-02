@@ -382,6 +382,15 @@ aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
       out->strides[1] < out->strides[0];
 
    if (compr_says_compressed || layout_says_ubwc) {
+      /* The one observable sign that the whole UBWC path fired. Without it the
+       * only way to tell a working driver from one that quietly fell back is to
+       * look at the screen, which reads the same for several different faults.
+       */
+      mesa_logi("aimapper: compressed layout detected via %s (meta stride=%d @%d, "
+                "data stride=%d @%d) - collapsing to 1 compressed plane",
+                compr_says_compressed ? "COMPRESSION metadata" : "plane signature",
+                out->strides[1], out->offsets[1], out->strides[0], out->offsets[0]);
+
       out->offsets[0] = 0;
       out->offsets[1] = 0;
       out->strides[1] = 0;

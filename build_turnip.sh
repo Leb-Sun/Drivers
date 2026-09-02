@@ -18,7 +18,7 @@ mesasrc="https://gitlab.freedesktop.org/mesa/mesa"
 srcfolder="mesa"
 MESA_COMMIT="$(cat mesa_hash.txt | tr -d '[:space:]')"
 
-# BUILD_VARIANT should be one of: b, p, p1, p2
+# BUILD_VARIANT should be one of: b, e, p, p1, p2
 BUILD_VARIANT="${BUILD_VARIANT:-b}"
 
 run_all(){

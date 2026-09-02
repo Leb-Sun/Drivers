@@ -209,7 +209,6 @@ jobs:
           target_commitish: ${{ needs.build.outputs.head_sha }}
           files: |
             WN-Turnip-${{ needs.build.outputs.build_version }}-b_Axxx.zip
-            WN-Turnip-${{ needs.build.outputs.build_version }}-e_Axxx.zip
             WN-Turnip-${{ needs.build.outputs.build_version }}-p_Axxx.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -237,6 +236,5 @@ jobs:
                  --notes "Rolling WinNative Turnip driver uploads."
           gh release upload "$tag" \
             "WN-Turnip-${VER}-b_Axxx.zip" \
-            "WN-Turnip-${VER}-e_Axxx.zip" \
             "WN-Turnip-${VER}-p_Axxx.zip" \
             --repo "$repo" --clobber
